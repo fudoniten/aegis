@@ -6,38 +6,200 @@ let
   cfg = config.aegis.secrets;
   hostname = config.networking.hostName;
 
+  # Compute actual target path (may be redirected in dry-run mode)
+  actualTarget = target:
+    if cfg.dryRun then "${cfg.dryRunPath}/${baseNameOf target}" else target;
+
   # Script to decrypt a secret with age
   decryptScript = { name, source, target, identity, user, group, permissions }:
-    pkgs.writeShellScript "aegis-decrypt-${name}" ''
+    let
+      realTarget = actualTarget target;
+      dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
+      logTarget = if cfg.dryRun then
+        "dry-run: ${realTarget} (would be: ${target})"
+      else
+        target;
+    in pkgs.writeShellScript "aegis-decrypt-${name}" ''
       set -euo pipefail
 
+      echo "${dryRunPrefix}Decrypting ${name} -> ${logTarget}"
+
       # Create target directory if needed
-      TARGET_DIR=$(dirname "${target}")
+      TARGET_DIR=$(dirname "${realTarget}")
       if [ ! -d "$TARGET_DIR" ]; then
         mkdir -p "$TARGET_DIR"
-        chown ${user}:${group} "$TARGET_DIR"
-        chmod 0750 "$TARGET_DIR"
+        ${
+          if cfg.dryRun then
+            "# Dry-run: skipping chown/chmod on directory"
+          else ''
+            chown ${user}:${group} "$TARGET_DIR"
+            chmod 0750 "$TARGET_DIR"
+          ''
+        }
       fi
 
       # Remove old secret if it exists
-      rm -f "${target}"
+      rm -f "${realTarget}"
 
       # Decrypt
       ${pkgs.age}/bin/age --decrypt \
         --identity "${identity}" \
-        --output "${target}" \
+        --output "${realTarget}" \
         "${source}"
 
       # Set ownership and permissions
-      chown ${user}:${group} "${target}"
-      chmod ${permissions} "${target}"
+      ${if cfg.dryRun then ''
+        # Dry-run: logging intended permissions instead of applying
+        echo "${dryRunPrefix}Would set: owner=${user}:${group} mode=${permissions} on ${target}"
+        chmod 0400 "${realTarget}"  # Secure the dry-run file at least
+      '' else ''
+        chown ${user}:${group} "${realTarget}"
+        chmod ${permissions} "${realTarget}"
+      ''}
+
+      ${if cfg.dryRun then ''
+        echo "${dryRunPrefix}Secret ${name} validated successfully (dry-run mode)"
+      '' else
+        ""}
     '';
 
   # Script to remove a secret
   removeScript = name: target:
-    pkgs.writeShellScript "aegis-remove-${name}" ''
-      rm -f "${target}"
+    let realTarget = actualTarget target;
+    in pkgs.writeShellScript "aegis-remove-${name}" ''
+      rm -f "${realTarget}"
     '';
+
+  # Script to decrypt all user secrets from manifest
+  # This reads the manifest to get actual secret names and targets
+  userSecretsScript = username: userSecretsPath:
+    let
+      dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
+      baseTarget = if cfg.dryRun then
+        "${cfg.dryRunPath}/users/${username}"
+      else
+        "/run/aegis/users/${username}";
+    in pkgs.writeShellScript "aegis-user-secrets-${username}" ''
+      set -euo pipefail
+
+      USER_KEY="/run/aegis/users/${username}/.key"
+      MANIFEST_ENC="${userSecretsPath}/manifest.age"
+      SECRETS_DIR="${userSecretsPath}/secrets"
+      TARGET_DIR="${baseTarget}"
+
+      echo "${dryRunPrefix}Decrypting secrets for user ${username}"
+
+      # Check user key exists
+      if [ ! -f "$USER_KEY" ]; then
+        echo "ERROR: User deployment key not found: $USER_KEY"
+        exit 1
+      fi
+
+      # Create target directories
+      mkdir -p "$TARGET_DIR/env"
+      mkdir -p "$TARGET_DIR/files"
+      ${if cfg.dryRun then
+        ""
+      else ''
+        chown ${username}:${username} "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
+        chmod 0700 "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
+      ''}
+
+      # Decrypt manifest to temp file
+      MANIFEST_TMP=$(mktemp)
+      trap "rm -f $MANIFEST_TMP" EXIT
+
+      if [ -f "$MANIFEST_ENC" ]; then
+        ${pkgs.age}/bin/age --decrypt \
+          --identity "$USER_KEY" \
+          --output "$MANIFEST_TMP" \
+          "$MANIFEST_ENC"
+      else
+        echo "WARNING: No manifest found at $MANIFEST_ENC"
+        exit 0
+      fi
+
+      # Parse manifest and decrypt each secret
+      # Manifest format (YAML):
+      #   secrets:
+      #     <hashed_name>.age:
+      #       name: <actual_name>
+      #       type: env|file
+      #       target: <optional target path for files>
+
+      ${pkgs.yq-go}/bin/yq e '.secrets | to_entries | .[] | [.key, .value.name, .value.type, .value.target // ""] | @tsv' "$MANIFEST_TMP" | \
+      while IFS=$'\t' read -r hashed_file actual_name secret_type target_path; do
+        SOURCE_FILE="$SECRETS_DIR/$hashed_file"
+        
+        if [ ! -f "$SOURCE_FILE" ]; then
+          echo "WARNING: Secret file not found: $SOURCE_FILE (for $actual_name)"
+          continue
+        fi
+        
+        # Determine target based on type
+        if [ "$secret_type" = "env" ]; then
+          TARGET_FILE="$TARGET_DIR/env/$actual_name"
+        elif [ "$secret_type" = "file" ] && [ -n "$target_path" ]; then
+          # For files with explicit target, use that (but redirect in dry-run)
+          ${
+            if cfg.dryRun then ''
+              TARGET_FILE="$TARGET_DIR/files/$actual_name"
+              echo "${dryRunPrefix}Would place $actual_name at $target_path"
+            '' else ''
+              TARGET_FILE="$target_path"
+            ''
+          }
+        else
+          TARGET_FILE="$TARGET_DIR/files/$actual_name"
+        fi
+        
+        # Create target directory if needed
+        TARGET_PARENT=$(dirname "$TARGET_FILE")
+        mkdir -p "$TARGET_PARENT"
+        
+        # Decrypt
+        echo "${dryRunPrefix}Decrypting $actual_name -> $TARGET_FILE"
+        ${pkgs.age}/bin/age --decrypt \
+          --identity "$USER_KEY" \
+          --output "$TARGET_FILE" \
+          "$SOURCE_FILE"
+        
+        ${
+          if cfg.dryRun then ''
+            chmod 0400 "$TARGET_FILE"
+          '' else ''
+            chown ${username}:${username} "$TARGET_FILE"
+            chmod 0400 "$TARGET_FILE"
+          ''
+        }
+      done
+
+      echo "${dryRunPrefix}User secrets for ${username} decrypted successfully"
+    '';
+
+  # Generate systemd service for user secrets (phase 2)
+  mkUserSecretsService = username: {
+    description = "Aegis: decrypt secrets for user ${username}${
+        optionalString cfg.dryRun " (DRY-RUN)"
+      }";
+    wantedBy = [ "aegis-phase2.target" ];
+    before = [ "aegis-phase2.target" ];
+    after = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
+    requires = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart =
+        userSecretsScript username "${cfg.secretsPath}/users/${username}";
+    } // (if cfg.dryRun then
+      { }
+    else {
+      # Run as the user for proper ownership (in production mode)
+      User = username;
+      Group = username;
+    });
+  };
 
   # Generate a systemd service for a secret
   mkSecretService = name: secretCfg: {
@@ -132,6 +294,30 @@ in {
   options.aegis.secrets = {
     enable = mkEnableOption "Aegis secrets management";
 
+    dryRun = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Enable dry-run mode for safe migration testing.
+
+        In dry-run mode:
+        - Secrets are decrypted to a separate directory (dryRunPath)
+        - Ownership/permissions are logged but not applied
+        - Services report success but don't affect production paths
+
+        Set to false for production deployment.
+      '';
+    };
+
+    dryRunPath = mkOption {
+      type = types.str;
+      default = "/run/aegis-dry-run";
+      description = ''
+        Directory for dry-run decryption output.
+        Only used when dryRun = true.
+      '';
+    };
+
     secretsPath = mkOption {
       type = types.path;
       description = "Path to the aegis-secrets build output for this host.";
@@ -198,16 +384,35 @@ in {
   };
 
   config = mkIf cfg.enable {
-    # Ensure /run/aegis exists
+    # Warn loudly if dry-run mode is enabled
+    warnings = mkIf cfg.dryRun [''
+      ╔═══════════════════════════════════════════════════════════════════╗
+      ║                    AEGIS DRY-RUN MODE ENABLED                     ║
+      ╠═══════════════════════════════════════════════════════════════════╣
+      ║  Secrets are being decrypted to ${cfg.dryRunPath}                 ║
+      ║  for testing purposes only. Production paths are NOT affected.   ║
+      ║                                                                   ║
+      ║  To deploy secrets for real, set:                                 ║
+      ║    aegis.secrets.dryRun = false;                                  ║
+      ╚═══════════════════════════════════════════════════════════════════╝
+    ''];
+
+    # Ensure /run/aegis exists (and dry-run path if enabled)
     systemd.tmpfiles.rules = [
       "d /run/aegis 0755 root root - -"
       "d /run/aegis/users 0755 root root - -"
       "d /run/aegis/roles 0755 root root - -"
+    ] ++ optionals cfg.dryRun [
+      "d ${cfg.dryRunPath} 0755 root root - -"
+      "d ${cfg.dryRunPath}/users 0755 root root - -"
+      "d ${cfg.dryRunPath}/roles 0755 root root - -"
     ];
 
     # Phase 1 target - host secrets decrypted with master key
     systemd.targets.aegis-phase1 = {
-      description = "Aegis phase 1: host secrets available";
+      description = "Aegis phase 1: host secrets available${
+          optionalString cfg.dryRun " (DRY-RUN)"
+        }";
       wantedBy = [ "multi-user.target" ];
       before = [ "multi-user.target" ];
       after = [ "local-fs.target" ];
@@ -215,7 +420,9 @@ in {
 
     # Phase 2 target - role/user secrets decrypted with phase 1 keys
     systemd.targets.aegis-phase2 = {
-      description = "Aegis phase 2: role and user secrets available";
+      description = "Aegis phase 2: role and user secrets available${
+          optionalString cfg.dryRun " (DRY-RUN)"
+        }";
       wantedBy = [ "multi-user.target" ];
       before = [ "multi-user.target" ];
       after = [ "aegis-phase1.target" ];
@@ -223,7 +430,8 @@ in {
 
     # Convenience target for services that need secrets
     systemd.targets.aegis-secrets = {
-      description = "Aegis: all secrets available";
+      description =
+        "Aegis: all secrets available${optionalString cfg.dryRun " (DRY-RUN)"}";
       wantedBy = [ "multi-user.target" ];
       after = [ "aegis-phase2.target" ];
       requires = [ "aegis-phase2.target" ];
@@ -292,8 +500,15 @@ in {
         };
       }) cfg.users);
 
+      # User secrets services (phase 2 - decrypt with user deployment key)
+      # These read the manifest and decrypt each secret
+      userSecretsServices = listToAttrs (map (user: {
+        name = "aegis-user-secrets-${user}";
+        value = mkUserSecretsService user;
+      }) cfg.users);
+
     in secretServices // sshKeyService // keytabService // roleKeyServices
-    // userKeyServices;
+    // userKeyServices // userSecretsServices;
 
     # Create group for secret access
     users.groups.aegis-secrets = { };

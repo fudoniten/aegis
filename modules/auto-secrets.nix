@@ -30,6 +30,22 @@ in {
   options.aegis.autoSecrets = {
     enable = mkEnableOption "Auto-discover secrets from build directory";
 
+    dryRun = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Enable dry-run mode for safe migration testing.
+        Secrets are decrypted to a test directory instead of production paths.
+        Set to false for production deployment.
+      '';
+    };
+
+    dryRunPath = mkOption {
+      type = types.str;
+      default = "/run/aegis-dry-run";
+      description = "Directory for dry-run decryption output.";
+    };
+
     buildPath = mkOption {
       type = types.path;
       description = "Path to aegis-secrets build output for this host.";
@@ -63,6 +79,8 @@ in {
   config = mkIf cfg.enable {
     aegis.secrets = {
       enable = true;
+      dryRun = cfg.dryRun;
+      dryRunPath = cfg.dryRunPath;
       secretsPath = cfg.buildPath;
       masterKeyPath = cfg.masterKeyPath;
       roles = cfg.roles;

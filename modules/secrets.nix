@@ -329,8 +329,12 @@ in {
       description = ''
         Path to the host's master key (private key) for decryption.
 
-        Age can use SSH ed25519 private keys directly - no conversion needed.
-        Just point this to your existing SSH host key or master key.
+        This is the key Aegis uses to decrypt secrets. It's typically an
+        SSH ed25519 private key stored on persistent storage.
+
+        NOTE: This is NOT an OpenSSH host key! This is the master key used
+        specifically for Aegis secret decryption. The OpenSSH host keys are
+        stored encrypted using this master key and decrypted at boot.
       '';
       example = "/state/master-key/key";
     };
@@ -342,12 +346,30 @@ in {
     };
 
     # Convenience options for common secret types
-    sshKeys = {
-      enable = mkEnableOption "SSH key secrets";
+    sshHostKeys = {
+      enable = mkEnableOption "SSH host key secrets (for OpenSSH server)";
 
       source = mkOption {
         type = types.nullOr types.path;
-        description = "Path to encrypted SSH keys file.";
+        description = ''
+          Path to encrypted SSH host keys file.
+
+          These are the keys OpenSSH uses to identify the server, NOT the
+          master key. They are stored in ssh-host-keys.age.
+        '';
+        default = null;
+      };
+    };
+
+    # Backward compatibility - keep sshKeys as alias
+    sshKeys = {
+      enable =
+        mkEnableOption "SSH host key secrets (DEPRECATED: use sshHostKeys)";
+
+      source = mkOption {
+        type = types.nullOr types.path;
+        description =
+          "Path to encrypted SSH keys file (DEPRECATED: use sshHostKeys).";
         default = null;
       };
     };
@@ -444,19 +466,26 @@ in {
         nameValuePair "aegis-secret-${name}" (mkSecretService name secretCfg))
         cfg.secrets;
 
-      # SSH keys (if enabled)
-      sshKeyService =
-        optionalAttrs (cfg.sshKeys.enable && cfg.sshKeys.source != null) {
-          aegis-ssh-keys = mkSecretService "ssh-keys" {
-            source = cfg.sshKeys.source;
-            target = "/run/aegis/ssh-keys";
-            user = "root";
-            group = "root";
-            permissions = "0400";
-            phase = 1;
-            identity = cfg.masterKeyPath;
-          };
+      # SSH host keys for OpenSSH (check both new and deprecated option names)
+      sshHostKeySource = if cfg.sshHostKeys.source != null then
+        cfg.sshHostKeys.source
+      else
+        cfg.sshKeys.source;
+      sshHostKeyEnabled =
+        (cfg.sshHostKeys.enable && cfg.sshHostKeys.source != null)
+        || (cfg.sshKeys.enable && cfg.sshKeys.source != null);
+
+      sshKeyService = optionalAttrs sshHostKeyEnabled {
+        aegis-ssh-host-keys = mkSecretService "ssh-host-keys" {
+          source = sshHostKeySource;
+          target = "/run/aegis/ssh-host-keys";
+          user = "root";
+          group = "root";
+          permissions = "0400";
+          phase = 1;
+          identity = cfg.masterKeyPath;
         };
+      };
 
       # Keytab (if enabled)
       keytabService =

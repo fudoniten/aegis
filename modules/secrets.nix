@@ -6,6 +6,41 @@ let
   cfg = config.aegis.secrets;
   hostname = config.networking.hostName;
 
+  # Load the secrets manifest from the build directory (if it exists)
+  # This is a plain TOML file that can be read at Nix evaluation time
+  manifestPath = "${cfg.secretsPath}/secrets.toml";
+  manifestExists = cfg.secretsPath != null && builtins.pathExists manifestPath;
+
+  # Parse the manifest, or return empty attrset if not found
+  manifest = if manifestExists then
+    builtins.fromTOML (builtins.readFile manifestPath)
+  else
+    { };
+
+  # Helper to get a nested attribute with a default
+  getOr = default: path: attrs:
+    let
+      go = path: attrs:
+        if path == [ ] then
+          attrs
+        else if attrs ? ${head path} then
+          go (tail path) attrs.${head path}
+        else
+          default;
+    in go path attrs;
+
+  # Extract SSH host keys config from manifest
+  sshHostKeysManifest = getOr null [ "ssh-host-keys" ] manifest;
+
+  # Extract keytab config from manifest
+  keytabManifest = getOr null [ "keytab" ] manifest;
+
+  # Extract nexus key config from manifest
+  nexusKeyManifest = getOr null [ "nexus-key" ] manifest;
+
+  # Extract extra secrets from manifest
+  secretsManifest = getOr { } [ "secrets" ] manifest;
+
   # Compute actual target path (may be redirected in dry-run mode)
   actualTarget = target:
     if cfg.dryRun then "${cfg.dryRunPath}/${baseNameOf target}" else target;
@@ -403,6 +438,188 @@ in {
       description = "Users whose secrets should be decrypted on this host.";
       default = [ ];
     };
+
+    # =========================================================================
+    # Manifest data (read-only, loaded from secrets.toml)
+    # These can be referenced in NixOS config to get target paths etc.
+    # =========================================================================
+
+    manifest = {
+      loaded = mkOption {
+        type = types.bool;
+        description = "Whether a secrets.toml manifest was found and loaded.";
+        default = manifestExists;
+        readOnly = true;
+      };
+
+      sshHostKeys = mkOption {
+        type = types.nullOr (types.submodule {
+          options = {
+            source = mkOption {
+              type = types.str;
+              description = "Source .age file";
+            };
+            targetDir = mkOption {
+              type = types.str;
+              description = "Target directory for SSH keys";
+            };
+            user = mkOption {
+              type = types.str;
+              description = "Owner user";
+            };
+            group = mkOption {
+              type = types.str;
+              description = "Owner group";
+            };
+            mode = mkOption {
+              type = types.str;
+              description = "File permissions";
+            };
+            keyTypes = mkOption {
+              type = types.listOf types.str;
+              description = "SSH key types included";
+            };
+          };
+        });
+        description = "SSH host keys configuration from manifest.";
+        default = if sshHostKeysManifest != null then {
+          source = sshHostKeysManifest.source or "ssh-host-keys.age";
+          targetDir = sshHostKeysManifest.target_dir or "/etc/ssh";
+          user = sshHostKeysManifest.user or "root";
+          group = sshHostKeysManifest.group or "root";
+          mode = sshHostKeysManifest.mode or "0600";
+          keyTypes = sshHostKeysManifest.key_types or [ ];
+        } else
+          null;
+        readOnly = true;
+      };
+
+      keytab = mkOption {
+        type = types.nullOr (types.submodule {
+          options = {
+            source = mkOption {
+              type = types.str;
+              description = "Source .age file";
+            };
+            target = mkOption {
+              type = types.str;
+              description = "Target path";
+            };
+            user = mkOption {
+              type = types.str;
+              description = "Owner user";
+            };
+            group = mkOption {
+              type = types.str;
+              description = "Owner group";
+            };
+            mode = mkOption {
+              type = types.str;
+              description = "File permissions";
+            };
+            encoding = mkOption {
+              type = types.nullOr types.str;
+              description = "Encoding (e.g., base64)";
+            };
+          };
+        });
+        description = "Kerberos keytab configuration from manifest.";
+        default = if keytabManifest != null then {
+          source = keytabManifest.source or "keytab.age";
+          target = keytabManifest.target or "/etc/krb5.keytab";
+          user = keytabManifest.user or "root";
+          group = keytabManifest.group or "root";
+          mode = keytabManifest.mode or "0600";
+          encoding = keytabManifest.encoding or null;
+        } else
+          null;
+        readOnly = true;
+      };
+
+      nexusKey = mkOption {
+        type = types.nullOr (types.submodule {
+          options = {
+            source = mkOption {
+              type = types.str;
+              description = "Source .age file";
+            };
+            target = mkOption {
+              type = types.str;
+              description = "Target path";
+            };
+            user = mkOption {
+              type = types.str;
+              description = "Owner user";
+            };
+            group = mkOption {
+              type = types.str;
+              description = "Owner group";
+            };
+            mode = mkOption {
+              type = types.str;
+              description = "File permissions";
+            };
+          };
+        });
+        description = "Nexus DDNS key configuration from manifest.";
+        default = if nexusKeyManifest != null then {
+          source = nexusKeyManifest.source or "nexus-key.age";
+          target = nexusKeyManifest.target or "/run/aegis/nexus-key";
+          user = nexusKeyManifest.user or "root";
+          group = nexusKeyManifest.group or "root";
+          mode = nexusKeyManifest.mode or "0400";
+        } else
+          null;
+        readOnly = true;
+      };
+
+      secrets = mkOption {
+        type = types.attrsOf (types.submodule {
+          options = {
+            source = mkOption {
+              type = types.str;
+              description = "Source .age file";
+            };
+            target = mkOption {
+              type = types.str;
+              description = "Target path";
+            };
+            user = mkOption {
+              type = types.str;
+              description = "Owner user";
+            };
+            group = mkOption {
+              type = types.str;
+              description = "Owner group";
+            };
+            mode = mkOption {
+              type = types.str;
+              description = "File permissions";
+            };
+          };
+        });
+        description = "Extra secrets configuration from manifest.";
+        default = mapAttrs (name: secretData: {
+          source = secretData.source or "secrets/${name}.age";
+          target = secretData.target or "/run/aegis/secrets/${name}";
+          user = secretData.user or "root";
+          group = secretData.group or "root";
+          mode = secretData.mode or "0400";
+        }) secretsManifest;
+        readOnly = true;
+      };
+    };
+
+    # Auto-configure from manifest
+    autoConfigureFromManifest = mkOption {
+      type = types.bool;
+      description = ''
+        Automatically configure secrets from the manifest file.
+        When enabled, secrets defined in secrets.toml will be automatically
+        set up for decryption without manual configuration.
+      '';
+      default = false;
+    };
   };
 
   config = mkIf cfg.enable {
@@ -461,7 +678,7 @@ in {
 
     # Generate services for all configured secrets
     systemd.services = let
-      # User-defined secrets
+      # User-defined secrets (manual configuration)
       secretServices = mapAttrs' (name: secretCfg:
         nameValuePair "aegis-secret-${name}" (mkSecretService name secretCfg))
         cfg.secrets;
@@ -487,7 +704,7 @@ in {
         };
       };
 
-      # Keytab (if enabled)
+      # Keytab (if enabled manually)
       keytabService =
         optionalAttrs (cfg.keytab.enable && cfg.keytab.source != null) {
           aegis-keytab = mkSecretService "keytab" {
@@ -536,8 +753,69 @@ in {
         value = mkUserSecretsService user;
       }) cfg.users);
 
+      # =======================================================================
+      # Auto-configured services from manifest
+      # =======================================================================
+
+      # SSH host keys from manifest
+      manifestSshService = optionalAttrs
+        (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null) {
+          aegis-ssh-host-keys = mkSecretService "ssh-host-keys" {
+            source = "${cfg.secretsPath}/${cfg.manifest.sshHostKeys.source}";
+            # Decrypt to intermediate location, then extract individual keys
+            target = "/run/aegis/ssh-host-keys.yaml";
+            user = cfg.manifest.sshHostKeys.user;
+            group = cfg.manifest.sshHostKeys.group;
+            permissions = cfg.manifest.sshHostKeys.mode;
+            phase = 1;
+            identity = cfg.masterKeyPath;
+          };
+        };
+
+      # Keytab from manifest
+      manifestKeytabService = optionalAttrs
+        (cfg.autoConfigureFromManifest && cfg.manifest.keytab != null) {
+          aegis-keytab = mkSecretService "keytab" {
+            source = "${cfg.secretsPath}/${cfg.manifest.keytab.source}";
+            target = cfg.manifest.keytab.target;
+            user = cfg.manifest.keytab.user;
+            group = cfg.manifest.keytab.group;
+            permissions = cfg.manifest.keytab.mode;
+            phase = 1;
+            identity = cfg.masterKeyPath;
+          };
+        };
+
+      # Nexus key from manifest
+      manifestNexusService = optionalAttrs
+        (cfg.autoConfigureFromManifest && cfg.manifest.nexusKey != null) {
+          aegis-nexus-key = mkSecretService "nexus-key" {
+            source = "${cfg.secretsPath}/${cfg.manifest.nexusKey.source}";
+            target = cfg.manifest.nexusKey.target;
+            user = cfg.manifest.nexusKey.user;
+            group = cfg.manifest.nexusKey.group;
+            permissions = cfg.manifest.nexusKey.mode;
+            phase = 1;
+            identity = cfg.masterKeyPath;
+          };
+        };
+
+      # Extra secrets from manifest
+      manifestSecretServices = optionalAttrs cfg.autoConfigureFromManifest
+        (mapAttrs' (name: secretManifest:
+          nameValuePair "aegis-secret-${name}" (mkSecretService name {
+            source = "${cfg.secretsPath}/${secretManifest.source}";
+            target = secretManifest.target;
+            user = secretManifest.user;
+            group = secretManifest.group;
+            permissions = secretManifest.mode;
+            phase = 1;
+            identity = cfg.masterKeyPath;
+          })) cfg.manifest.secrets);
+
     in secretServices // sshKeyService // keytabService // roleKeyServices
-    // userKeyServices // userSecretsServices;
+    // userKeyServices // userSecretsServices // manifestSshService
+    // manifestKeytabService // manifestNexusService // manifestSecretServices;
 
     # Create group for secret access
     users.groups.aegis-secrets = { };

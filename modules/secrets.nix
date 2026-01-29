@@ -6,10 +6,17 @@ let
   cfg = config.aegis.secrets;
   hostname = config.networking.hostName;
 
+  # Compute the host-specific secrets path
+  # If secretsRepoPath is set, derive the path; otherwise use secretsPath directly
+  hostSecretsPath = if cfg.secretsRepoPath != null then
+    "${cfg.secretsRepoPath}/build/hosts/${hostname}"
+  else
+    cfg.secretsPath;
+
   # Load the secrets manifest from the build directory (if it exists)
   # This is a plain TOML file that can be read at Nix evaluation time
-  manifestPath = "${cfg.secretsPath}/secrets.toml";
-  manifestExists = cfg.secretsPath != null && builtins.pathExists manifestPath;
+  manifestPath = "${hostSecretsPath}/secrets.toml";
+  manifestExists = builtins.pathExists manifestPath;
 
   # Parse the manifest, or return empty attrset if not found
   manifest = if manifestExists then
@@ -353,9 +360,40 @@ in {
       '';
     };
 
+    secretsRepoPath = mkOption {
+      type = types.nullOr types.path;
+      description = ''
+        Path to the aegis-secrets repository or its build output.
+
+        When set, secretsPath is automatically computed as:
+          ''${secretsRepoPath}/build/hosts/''${networking.hostName}
+
+        This is the recommended way to configure aegis - just point to the
+        repo and it will find the right host's secrets automatically.
+
+        Example (in a flake):
+          aegis.secrets = {
+            enable = true;
+            secretsRepoPath = inputs.aegis-secrets;
+            masterKeyPath = "/state/master-key/key";
+          };
+      '';
+      default = null;
+      example = "/path/to/aegis-secrets";
+    };
+
     secretsPath = mkOption {
       type = types.path;
-      description = "Path to the aegis-secrets build output for this host.";
+      description = ''
+        Path to the aegis-secrets build output for this specific host.
+
+        Usually you should set secretsRepoPath instead and let this be
+        computed automatically. Only set this directly if you have a
+        non-standard directory structure.
+      '';
+      default = hostSecretsPath;
+      defaultText = literalExpression
+        ''"''${secretsRepoPath}/build/hosts/''${networking.hostName}"'';
       example = "/path/to/aegis-secrets/build/hosts/myhost";
     };
 

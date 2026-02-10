@@ -1,7 +1,7 @@
 {
   description = "Aegis - Encrypted secrets management for NixOS";
 
-  inputs = { nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11"; };
+  inputs = { nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11"; };
 
   outputs = { self, nixpkgs, ... }: {
     # NixOS modules

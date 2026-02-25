@@ -114,13 +114,10 @@ in {
       # SSH host keys (for OpenSSH server)
       # Check both old name (ssh-keys.age) and new name (ssh-host-keys.age) for compatibility
       sshKeys = {
-        enable = builtins.pathExists "${cfg.buildPath}/ssh-host-keys.age"
-          || builtins.pathExists "${cfg.buildPath}/ssh-keys.age";
+        enable = builtins.pathExists "${cfg.buildPath}/ssh-host-keys.age";
         source =
           if builtins.pathExists "${cfg.buildPath}/ssh-host-keys.age" then
             "${cfg.buildPath}/ssh-host-keys.age"
-          else if builtins.pathExists "${cfg.buildPath}/ssh-keys.age" then
-            "${cfg.buildPath}/ssh-keys.age"
           else
             null;
       };

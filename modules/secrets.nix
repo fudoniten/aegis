@@ -6,6 +6,9 @@ let
   cfg = config.aegis.secrets;
   hostname = config.networking.hostName;
 
+  stringPadRight = count: str:
+    str + (strings.replicate (count - (length str)) " ");
+
   # Compute the host-specific secrets path
   # If secretsRepoPath is set, derive the path; otherwise use secretsPath directly
   hostSecretsPath = if cfg.secretsRepoPath != null then
@@ -663,8 +666,8 @@ in {
       ╔═══════════════════════════════════════════════════════════════════╗
       ║                    AEGIS DRY-RUN MODE ENABLED                     ║
       ╠═══════════════════════════════════════════════════════════════════╣
-      ║  Secrets are being decrypted to ${cfg.dryRunPath}                 ║
-      ║  for testing purposes only. Production paths are NOT affected.   ║
+      ║  Secrets are being decrypted to ${stringPadRight 34 cfg.dryRunPath}║
+      ║  for testing purposes only. Production paths are NOT affected.    ║
       ║                                                                   ║
       ║  To deploy secrets for real, set:                                 ║
       ║    aegis.secrets.dryRun = false;                                  ║

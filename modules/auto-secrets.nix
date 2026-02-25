@@ -74,6 +74,15 @@ in {
       description = "Roles this host has.";
       default = [ ];
     };
+
+    verbose = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Enable verbose output at Nix evaluation time.
+        When enabled, prints the list of secret names being configured for this host.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -85,6 +94,7 @@ in {
       masterKeyPath = cfg.masterKeyPath;
       roles = cfg.roles;
       users = cfg.users;
+      verbose = cfg.verbose;
 
       # Auto-discover host secrets
       secrets = let

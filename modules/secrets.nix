@@ -658,21 +658,54 @@ in {
       '';
       default = false;
     };
+
+    verbose = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Enable verbose output at Nix evaluation time.
+        When enabled, prints the list of secret names being configured for this host.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
-    # Warn loudly if dry-run mode is enabled
-    warnings = mkIf cfg.dryRun [''
-      ╔═══════════════════════════════════════════════════════════════════╗
-      ║                    AEGIS DRY-RUN MODE ENABLED                     ║
-      ╠═══════════════════════════════════════════════════════════════════╣
-      ║  Secrets are being decrypted to ${cfg.dryRunPath}                 ║
-      ║  for testing purposes only. Production paths are NOT affected.   ║
-      ║                                                                   ║
-      ║  To deploy secrets for real, set:                                 ║
-      ║    aegis.secrets.dryRun = false;                                  ║
-      ╚═══════════════════════════════════════════════════════════════════╝
-    ''];
+    # Warn loudly if dry-run mode is enabled; list secrets if verbose
+    warnings =
+      optionals cfg.dryRun [''
+        ╔═══════════════════════════════════════════════════════════════════╗
+        ║                    AEGIS DRY-RUN MODE ENABLED                     ║
+        ╠═══════════════════════════════════════════════════════════════════╣
+        ║  Secrets are being decrypted to ${cfg.dryRunPath}                 ║
+        ║  for testing purposes only. Production paths are NOT affected.   ║
+        ║                                                                   ║
+        ║  To deploy secrets for real, set:                                 ║
+        ║    aegis.secrets.dryRun = false;                                  ║
+        ╚═══════════════════════════════════════════════════════════════════╝
+      '']
+      ++ optionals cfg.verbose (
+        let
+          sshHostKeyEnabled =
+            (cfg.sshHostKeys.enable && cfg.sshHostKeys.source != null)
+            || (cfg.sshKeys.enable && cfg.sshKeys.source != null);
+          allSecretNames = unique (
+            (attrNames cfg.secrets)
+            ++ optionals sshHostKeyEnabled [ "ssh-host-keys" ]
+            ++ optionals (cfg.keytab.enable && cfg.keytab.source != null) [ "keytab" ]
+            ++ map (role: "role-${role}") cfg.roles
+            ++ map (user: "user-key-${user}") cfg.users
+            ++ map (user: "user-secrets-${user}") cfg.users
+            ++ optionals (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null) [ "ssh-host-keys" ]
+            ++ optionals (cfg.autoConfigureFromManifest && cfg.manifest.keytab != null) [ "keytab" ]
+            ++ optionals (cfg.autoConfigureFromManifest && cfg.manifest.nexusKey != null) [ "nexus-key" ]
+            ++ optionals cfg.autoConfigureFromManifest (attrNames cfg.manifest.secrets)
+          );
+        in
+        [''
+          Aegis [${hostname}]: ${toString (length allSecretNames)} secret(s) configured for this host:
+          ${concatMapStringsSep "\n" (name: "  - ${name}") allSecretNames}
+        '']
+      );
 
     # Ensure /run/aegis exists (and dry-run path if enabled)
     systemd.tmpfiles.rules = [

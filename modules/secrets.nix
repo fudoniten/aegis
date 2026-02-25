@@ -410,6 +410,7 @@ in {
         stored encrypted using this master key and decrypted at boot.
       '';
       example = "/state/master-key/key";
+      default = "/state/master-key/key";
     };
 
     secrets = mkOption {
@@ -430,19 +431,6 @@ in {
           These are the keys OpenSSH uses to identify the server, NOT the
           master key. They are stored in ssh-host-keys.age.
         '';
-        default = null;
-      };
-    };
-
-    # Backward compatibility - keep sshKeys as alias
-    sshKeys = {
-      enable =
-        mkEnableOption "SSH host key secrets (DEPRECATED: use sshHostKeys)";
-
-      source = mkOption {
-        type = types.nullOr types.path;
-        description =
-          "Path to encrypted SSH keys file (DEPRECATED: use sshHostKeys).";
         default = null;
       };
     };
@@ -755,13 +743,9 @@ in {
         cfg.secrets;
 
       # SSH host keys for OpenSSH (check both new and deprecated option names)
-      sshHostKeySource = if cfg.sshHostKeys.source != null then
-        cfg.sshHostKeys.source
-      else
-        cfg.sshKeys.source;
+      sshHostKeySource = cfg.sshHostKeys.source;
       sshHostKeyEnabled =
-        (cfg.sshHostKeys.enable && cfg.sshHostKeys.source != null)
-        || (cfg.sshKeys.enable && cfg.sshKeys.source != null);
+        (cfg.sshHostKeys.enable && cfg.sshHostKeys.source != null);
 
       sshKeyService = optionalAttrs sshHostKeyEnabled {
         aegis-ssh-host-keys = mkSecretService "ssh-host-keys" {

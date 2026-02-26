@@ -7,7 +7,7 @@ let
   hostname = config.networking.hostName;
 
   stringPadRight = count: str:
-    str + (strings.replicate (count - (length str)) " ");
+    str + (strings.replicate (count - (stringLength str)) " ");
 
   # Compute the host-specific secrets path
   # If secretsRepoPath is set, derive the path; otherwise use secretsPath directly

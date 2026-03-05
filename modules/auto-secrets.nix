@@ -96,9 +96,26 @@ in {
       users = cfg.users;
       verbose = cfg.verbose;
 
-      # Auto-discover host secrets
+      # Auto-discover SSH host key types from ssh_host_*_key.age files
+      sshHostKeys =
+        let
+          allFiles = listDir cfg.buildPath;
+          sshKeyTypes = lib.pipe allFiles [
+            (builtins.filter
+              (n: builtins.match "ssh_host_.*_key\\.age" n != null))
+            (map (n:
+              builtins.head (builtins.match "ssh_host_(.*)_key\\.age" n)))
+          ];
+        in {
+          enable = sshKeyTypes != [ ];
+          keyTypes = sshKeyTypes;
+        };
+
+      # Auto-discover host secrets (excluding SSH host key files handled above)
       secrets = let
-        hostSecrets = findAgeFiles cfg.buildPath;
+        hostSecrets = filter
+          (n: builtins.match "ssh_host_.*_key\\.age" n == null)
+          (findAgeFiles cfg.buildPath);
 
         mkHostSecret = filename: {
           name = removeSuffix ".age" filename;
@@ -110,17 +127,6 @@ in {
         };
 
       in listToAttrs (map mkHostSecret hostSecrets);
-
-      # SSH host keys (for OpenSSH server)
-      # Check both old name (ssh-keys.age) and new name (ssh-host-keys.age) for compatibility
-      sshHostKeys = {
-        enable = builtins.pathExists "${cfg.buildPath}/ssh-host-keys.age";
-        source =
-          if builtins.pathExists "${cfg.buildPath}/ssh-host-keys.age" then
-            "${cfg.buildPath}/ssh-host-keys.age"
-          else
-            null;
-      };
 
       # Keytab
       keytab = {

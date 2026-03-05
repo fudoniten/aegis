@@ -115,6 +115,67 @@ let
       rm -f "${realTarget}"
     '';
 
+  # Script to install an SSH host key pair (decrypt privkey + copy pubkey)
+  sshKeyPairScript =
+    { keyType, sourceDir, targetDir, identity, user, group, privMode }:
+    let
+      privSource = "${sourceDir}/ssh_host_${keyType}_key.age";
+      pubSource = "${sourceDir}/ssh_host_${keyType}_key.pub";
+      privTarget = "${targetDir}/ssh_host_${keyType}_key";
+      pubTarget = "${targetDir}/ssh_host_${keyType}_key.pub";
+      realPrivTarget = actualTarget privTarget;
+      realPubTarget = actualTarget pubTarget;
+      dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
+    in pkgs.writeShellScript "aegis-ssh-key-${keyType}" ''
+      set -euo pipefail
+
+      echo "${dryRunPrefix}Installing SSH host key ${keyType}"
+
+      TARGET_DIR="${
+        if cfg.dryRun then cfg.dryRunPath else targetDir
+      }"
+      if [ ! -d "$TARGET_DIR" ]; then
+        mkdir -p "$TARGET_DIR"
+        ${
+          if cfg.dryRun then
+            "# Dry-run: skipping chown/chmod on directory"
+          else ''
+            chown ${user}:${group} "$TARGET_DIR"
+            chmod 0750 "$TARGET_DIR"
+          ''
+        }
+      fi
+
+      # Decrypt private key
+      rm -f "${realPrivTarget}"
+      ${pkgs.age}/bin/age --decrypt \
+        --identity "${identity}" \
+        --output "${realPrivTarget}" \
+        "${privSource}"
+      ${
+        if cfg.dryRun then ''
+          chmod 0400 "${realPrivTarget}"
+          echo "${dryRunPrefix}Would set: owner=${user}:${group} mode=${privMode} on ${privTarget}"
+        '' else ''
+          chown ${user}:${group} "${realPrivTarget}"
+          chmod ${privMode} "${realPrivTarget}"
+        ''
+      }
+
+      # Install public key
+      rm -f "${realPubTarget}"
+      cp "${pubSource}" "${realPubTarget}"
+      ${
+        if cfg.dryRun then ''
+          chmod 0444 "${realPubTarget}"
+          echo "${dryRunPrefix}Would set: owner=${user}:${group} mode=0644 on ${pubTarget}"
+        '' else ''
+          chown ${user}:${group} "${realPubTarget}"
+          chmod 0644 "${realPubTarget}"
+        ''
+      }
+    '';
+
   # Script to decrypt all user secrets from manifest
   # This reads the manifest to get actual secret names and targets
   userSecretsScript = username: userSecretsPath:
@@ -278,6 +339,38 @@ let
     };
   };
 
+  # Generate a systemd service for an SSH host key pair
+  mkSshKeyPairService = keyType: sshCfg: {
+    description = "Aegis: install SSH host key ${keyType}";
+    wantedBy = [ "aegis-phase1.target" ];
+    before = [ "aegis-phase1.target" ];
+    after = [ "local-fs.target" ];
+    requires = [ "local-fs.target" ];
+
+    restartIfChanged = true;
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = sshKeyPairScript {
+        inherit keyType;
+        sourceDir = sshCfg.sourceDir;
+        targetDir = sshCfg.targetDir;
+        identity = sshCfg.identity;
+        user = sshCfg.user;
+        group = sshCfg.group;
+        privMode = sshCfg.privMode;
+      };
+      ExecStop =
+        let
+          privTarget = "${sshCfg.targetDir}/ssh_host_${keyType}_key";
+          pubTarget = "${sshCfg.targetDir}/ssh_host_${keyType}_key.pub";
+        in pkgs.writeShellScript "aegis-remove-ssh-key-${keyType}" ''
+          rm -f "${actualTarget privTarget}" "${actualTarget pubTarget}"
+        '';
+    };
+  };
+
   # Secret options submodule
   secretOpts = { name, ... }: {
     options = {
@@ -426,15 +519,23 @@ in {
     sshHostKeys = {
       enable = mkEnableOption "SSH host key secrets (for OpenSSH server)";
 
-      source = mkOption {
-        type = types.nullOr types.path;
+      keyTypes = mkOption {
+        type = types.listOf types.str;
         description = ''
-          Path to encrypted SSH host keys file.
+          SSH key types to install.
 
-          These are the keys OpenSSH uses to identify the server, NOT the
-          master key. They are stored in ssh-host-keys.age.
+          For each type, expects two files in secretsPath:
+            ssh_host_''${type}_key.age  (encrypted private key)
+            ssh_host_''${type}_key.pub  (plaintext public key)
         '';
-        default = null;
+        default = [ ];
+        example = [ "ed25519" "rsa" ];
+      };
+
+      targetDir = mkOption {
+        type = types.str;
+        description = "Directory where decrypted SSH host keys are placed.";
+        default = "/etc/ssh";
       };
     };
 
@@ -484,10 +585,6 @@ in {
       sshHostKeys = mkOption {
         type = types.nullOr (types.submodule {
           options = {
-            source = mkOption {
-              type = types.str;
-              description = "Source .age file";
-            };
             targetDir = mkOption {
               type = types.str;
               description = "Target directory for SSH keys";
@@ -502,7 +599,7 @@ in {
             };
             mode = mkOption {
               type = types.str;
-              description = "File permissions";
+              description = "File permissions for private keys";
             };
             keyTypes = mkOption {
               type = types.listOf types.str;
@@ -512,7 +609,6 @@ in {
         });
         description = "SSH host keys configuration from manifest.";
         default = if sshHostKeysManifest != null then {
-          source = sshHostKeysManifest.source or "ssh-host-keys.age";
           targetDir = sshHostKeysManifest.target_dir or "/etc/ssh";
           user = sshHostKeysManifest.user or "root";
           group = sshHostKeysManifest.group or "root";
@@ -742,22 +838,22 @@ in {
         nameValuePair "aegis-secret-${name}" (mkSecretService name secretCfg))
         cfg.secrets;
 
-      # SSH host keys for OpenSSH (check both new and deprecated option names)
-      sshHostKeySource = cfg.sshHostKeys.source;
+      # SSH host keys for OpenSSH (one service per key type)
       sshHostKeyEnabled =
-        (cfg.sshHostKeys.enable && cfg.sshHostKeys.source != null);
+        cfg.sshHostKeys.enable && cfg.sshHostKeys.keyTypes != [ ];
 
-      sshKeyService = optionalAttrs sshHostKeyEnabled {
-        aegis-ssh-host-keys = mkSecretService "ssh-host-keys" {
-          source = sshHostKeySource;
-          target = "/run/aegis/ssh-host-keys";
-          user = "root";
-          group = "root";
-          permissions = "0400";
-          phase = 1;
-          identity = cfg.masterKeyPath;
-        };
-      };
+      sshKeyService = optionalAttrs sshHostKeyEnabled
+        (listToAttrs (map (keyType: {
+          name = "aegis-ssh-host-key-${keyType}";
+          value = mkSshKeyPairService keyType {
+            sourceDir = cfg.secretsPath;
+            targetDir = cfg.sshHostKeys.targetDir;
+            user = "root";
+            group = "root";
+            privMode = "0600";
+            identity = cfg.masterKeyPath;
+          };
+        }) cfg.sshHostKeys.keyTypes));
 
       # Keytab (if enabled manually)
       keytabService =
@@ -814,18 +910,18 @@ in {
 
       # SSH host keys from manifest
       manifestSshService = optionalAttrs
-        (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null) {
-          aegis-ssh-host-keys = mkSecretService "ssh-host-keys" {
-            source = "${cfg.secretsPath}/${cfg.manifest.sshHostKeys.source}";
-            # Decrypt to intermediate location, then extract individual keys
-            target = "/run/aegis/ssh-host-keys.yaml";
+        (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null)
+        (listToAttrs (map (keyType: {
+          name = "aegis-ssh-host-key-${keyType}";
+          value = mkSshKeyPairService keyType {
+            sourceDir = cfg.secretsPath;
+            targetDir = cfg.manifest.sshHostKeys.targetDir;
             user = cfg.manifest.sshHostKeys.user;
             group = cfg.manifest.sshHostKeys.group;
-            permissions = cfg.manifest.sshHostKeys.mode;
-            phase = 1;
+            privMode = cfg.manifest.sshHostKeys.mode;
             identity = cfg.masterKeyPath;
           };
-        };
+        }) cfg.manifest.sshHostKeys.keyTypes));
 
       # Keytab from manifest
       manifestKeytabService = optionalAttrs

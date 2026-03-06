@@ -870,7 +870,7 @@ in {
         (listToAttrs (map (keyType: {
           name = "aegis-ssh-host-key-${keyType}";
           value = mkSshKeyPairService keyType {
-            sourceDir = cfg.secretsPath;
+            sourceDir = "${cfg.secretsPath}/ssh";
             targetDir = cfg.sshHostKeys.targetDir;
             user = "root";
             group = "root";
@@ -938,7 +938,7 @@ in {
         (listToAttrs (map (entry: {
           name = "aegis-ssh-host-key-${entry.type}";
           value = mkSshKeyPairService entry.type {
-            sourceDir = cfg.secretsPath;
+            sourceDir = "${cfg.secretsPath}/ssh";
             targetDir = entry.targetDir;
             user = entry.user;
             group = entry.group;

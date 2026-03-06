@@ -99,7 +99,7 @@ in {
       # Auto-discover SSH host key types from ssh_host_*_key.age files
       sshHostKeys =
         let
-          allFiles = listDir cfg.buildPath;
+          allFiles = listDir "${cfg.buildPath}/ssh";
           sshKeyTypes = lib.pipe allFiles [
             (builtins.filter
               (n: builtins.match "ssh_host_.*_key\\.age" n != null))

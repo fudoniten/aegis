@@ -583,8 +583,12 @@ in {
       };
 
       sshHostKeys = mkOption {
-        type = types.nullOr (types.submodule {
+        type = types.nullOr (types.listOf (types.submodule {
           options = {
+            type = mkOption {
+              type = types.str;
+              description = "SSH key type (e.g. ed25519, rsa)";
+            };
             targetDir = mkOption {
               type = types.str;
               description = "Target directory for SSH keys";
@@ -601,20 +605,18 @@ in {
               type = types.str;
               description = "File permissions for private keys";
             };
-            keyTypes = mkOption {
-              type = types.listOf types.str;
-              description = "SSH key types included";
-            };
           };
-        });
+        }));
         description = "SSH host keys configuration from manifest.";
-        default = if sshHostKeysManifest != null then {
-          targetDir = sshHostKeysManifest.target_dir or "/etc/ssh";
-          user = sshHostKeysManifest.user or "root";
-          group = sshHostKeysManifest.group or "root";
-          mode = sshHostKeysManifest.mode or "0600";
-          keyTypes = sshHostKeysManifest.key_types or [ ];
-        } else
+        default = if sshHostKeysManifest != null then
+          map (entry: {
+            type = entry.type;
+            targetDir = entry.target_dir or "/etc/ssh";
+            user = entry.user or "root";
+            group = entry.group or "root";
+            mode = entry.mode or "0600";
+          }) sshHostKeysManifest
+        else
           null;
         readOnly = true;
       };
@@ -768,12 +770,12 @@ in {
       {
         assertion =
           !(cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null
-            && cfg.manifest.sshHostKeys.keyTypes == [ ]);
+            && cfg.manifest.sshHostKeys == [ ]);
         message = ''
-          The secrets.toml manifest for ${hostname} has an [ssh-host-keys] section
-          but key_types is empty or missing. No SSH host key services would be created.
-          Add key_types to the [ssh-host-keys] section in secrets.toml,
-          e.g.: key_types = ["ed25519", "rsa"]
+          The secrets.toml manifest for ${hostname} has an ssh-host-keys section
+          but it is empty. No SSH host key services would be created.
+          Add entries with a type attribute to the [[ssh-host-keys]] section in secrets.toml,
+          e.g.: [[ssh-host-keys]] / type = "ed25519"
         '';
       }
     ];
@@ -799,7 +801,7 @@ in {
         ++ map (user: "user-key-${user}") cfg.users
         ++ map (user: "user-secrets-${user}") cfg.users ++ optionals
         (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null
-          && cfg.manifest.sshHostKeys.keyTypes != [ ])
+          && cfg.manifest.sshHostKeys != [ ])
         [ "ssh-host-keys" ] ++ optionals
         (cfg.autoConfigureFromManifest && cfg.manifest.keytab != null)
         [ "keytab" ] ++ optionals
@@ -933,17 +935,17 @@ in {
       # SSH host keys from manifest
       manifestSshService = optionalAttrs
         (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null)
-        (listToAttrs (map (keyType: {
-          name = "aegis-ssh-host-key-${keyType}";
-          value = mkSshKeyPairService keyType {
+        (listToAttrs (map (entry: {
+          name = "aegis-ssh-host-key-${entry.type}";
+          value = mkSshKeyPairService entry.type {
             sourceDir = cfg.secretsPath;
-            targetDir = cfg.manifest.sshHostKeys.targetDir;
-            user = cfg.manifest.sshHostKeys.user;
-            group = cfg.manifest.sshHostKeys.group;
-            privMode = cfg.manifest.sshHostKeys.mode;
+            targetDir = entry.targetDir;
+            user = entry.user;
+            group = entry.group;
+            privMode = entry.mode;
             identity = cfg.masterKeyPath;
           };
-        }) cfg.manifest.sshHostKeys.keyTypes));
+        }) cfg.manifest.sshHostKeys));
 
       # Keytab from manifest
       manifestKeytabService = optionalAttrs

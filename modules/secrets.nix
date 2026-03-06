@@ -757,6 +757,27 @@ in {
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !(cfg.sshHostKeys.enable && cfg.sshHostKeys.keyTypes == [ ]);
+        message = ''
+          aegis.secrets.sshHostKeys.enable is true but no key types are configured.
+          Set aegis.secrets.sshHostKeys.keyTypes (e.g. [ "ed25519" "rsa" ]) or disable sshHostKeys.
+        '';
+      }
+      {
+        assertion =
+          !(cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null
+            && cfg.manifest.sshHostKeys.keyTypes == [ ]);
+        message = ''
+          The secrets.toml manifest for ${hostname} has an [ssh-host-keys] section
+          but key_types is empty or missing. No SSH host key services would be created.
+          Add key_types to the [ssh-host-keys] section in secrets.toml,
+          e.g.: key_types = ["ed25519", "rsa"]
+        '';
+      }
+    ];
+
     # Warn loudly if dry-run mode is enabled; list secrets if verbose
     warnings = optionals cfg.dryRun [''
       ╔═══════════════════════════════════════════════════════════════════╗
@@ -770,14 +791,15 @@ in {
       ╚═══════════════════════════════════════════════════════════════════╝
     ''] ++ optionals cfg.verbose (let
       sshHostKeyEnabled =
-        (cfg.sshHostKeys.enable && cfg.sshHostKeys.source != null);
+        (cfg.sshHostKeys.enable && cfg.sshHostKeys.keyTypes != [ ]);
       allSecretNames = unique ((attrNames cfg.secrets)
         ++ optionals sshHostKeyEnabled [ "ssh-host-keys" ]
         ++ optionals (cfg.keytab.enable && cfg.keytab.source != null)
         [ "keytab" ] ++ map (role: "role-${role}") cfg.roles
         ++ map (user: "user-key-${user}") cfg.users
         ++ map (user: "user-secrets-${user}") cfg.users ++ optionals
-        (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null)
+        (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null
+          && cfg.manifest.sshHostKeys.keyTypes != [ ])
         [ "ssh-host-keys" ] ++ optionals
         (cfg.autoConfigureFromManifest && cfg.manifest.keytab != null)
         [ "keytab" ] ++ optionals

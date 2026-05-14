@@ -105,8 +105,10 @@ aegis-secrets/                       Phase 1: Decrypt with master-key
 
 ### 3. Role Keys
 - **Purpose**: Cross-host access (KDC reads all keytabs, DNS reads DNSSEC)
-- **Generation**: `aegis make-role-key <role> <hostname>`
-- **Encryption**: Role-holder's master-key + admin key
+- **Model**: A role is a group of zero or more member hosts. All member hosts get a copy of the role's private key, encrypted with their own master key.
+- **Generation**: `aegis init-role <role>` creates the keypair; `aegis add-host-to-role <role> <hostname>` adds a host, generating `build/hosts/<hostname>/roles/<role>.age`
+- **Encryption**: Each copy encrypted for one member host's master-key + admin key
+- **Role secrets**: Encrypted with the role's public key; any host that has the role key can decrypt them in Phase 2
 
 ### 4. User Keys (Two-Layer System)
 **User Repo Key** (for user repo -> central repo):
@@ -286,8 +288,10 @@ aegis grant-user-access <username> <hostname>    # Add host to user's access lis
 aegis revoke-user-access <username> <hostname>
 
 # Role management  
-aegis init-role <role> <hostname>                # Create role, assign to host
-aegis move-role <role> <from-host> <to-host>
+aegis init-role <role>                           # Create role keypair
+aegis add-host-to-role <role> <hostname>         # Add host as member (generates per-host role key copy)
+aegis remove-host-from-role <role> <hostname>    # Remove host from role
+aegis move-role <role> <from-host> <to-host>     # Shorthand for remove + add
 
 # Utilities
 aegis list [hostname]                            # List secrets (all or per-host)
@@ -611,22 +615,27 @@ aegis-secrets/
   build/
     hosts/
       nostromo/
+        secrets.toml        # manifest: ssh-host-keys, keytab, roles list, etc.
         ssh-keys.age        # encrypted for nostromo's master-key
         keytab.age
         filesystem-keys.age
+        roles/
+          kdc.age           # kdc role private key encrypted for nostromo's master-key
         users/
           niten/
             env.age         # niten's env vars for this host
             files.age
       legatus/
+        roles/
+          kdc.age           # same kdc role key encrypted for legatus's master-key
         ...
     domains/
       fudo.org/
         realm-master-key.age
         dnssec.age
     roles/
-      kdc.age
-      dns.age
+      kdc/
+        some-role-secret.age  # encrypted with kdc role public key (phase 2)
 ```
 
 ### aegis-secrets-niten/ (User Repo - User Controlled)

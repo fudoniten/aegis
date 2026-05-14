@@ -71,7 +71,12 @@ in {
 
     roles = mkOption {
       type = types.listOf types.str;
-      description = "Roles this host has.";
+      description = ''
+        Additional roles to enable for this host. By default, roles are
+        auto-discovered from <buildPath>/roles/*.age — any role key file
+        present for this host will be decrypted. Use this to add roles
+        beyond what is in the build directory.
+      '';
       default = [ ];
     };
 
@@ -92,7 +97,8 @@ in {
       dryRunPath = cfg.dryRunPath;
       secretsPath = cfg.buildPath;
       masterKeyPath = cfg.masterKeyPath;
-      roles = cfg.roles;
+      roles = unique (cfg.roles
+        ++ map (removeSuffix ".age") (findAgeFiles "${cfg.buildPath}/roles"));
       users = cfg.users;
       verbose = cfg.verbose;
 

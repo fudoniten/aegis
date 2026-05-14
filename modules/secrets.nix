@@ -48,6 +48,9 @@ let
   # Extract nexus key config from manifest
   nexusKeyManifest = getOr null [ "nexus-key" ] manifest;
 
+  # Extract roles list from manifest
+  rolesManifest = getOr [ ] [ "roles" ] manifest;
+
   # Extract extra secrets from manifest
   secretsManifest = getOr { } [ "secrets" ] manifest;
 
@@ -558,8 +561,8 @@ in {
     roles = mkOption {
       type = types.listOf types.str;
       description =
-        "Roles this host has (e.g., kdc, dns). Role keys will be decrypted.";
-      default = [ ];
+        "Roles this host has (e.g., kdc, dns). Role keys will be decrypted from roles/<role>.age inside the host secrets directory. Defaults to the roles list in secrets.toml if present.";
+      default = rolesManifest;
       example = [ "kdc" "dns" ];
     };
 
@@ -735,6 +738,13 @@ in {
         }) secretsManifest;
         readOnly = true;
       };
+
+      roles = mkOption {
+        type = types.listOf types.str;
+        description = "Roles declared in secrets.toml for this host.";
+        default = rolesManifest;
+        readOnly = true;
+      };
     };
 
     # Auto-configure from manifest
@@ -897,7 +907,7 @@ in {
       roleKeyServices = listToAttrs (map (role: {
         name = "aegis-role-${role}";
         value = mkSecretService "role-${role}" {
-          source = "${cfg.secretsPath}/../roles/${role}.age";
+          source = "${cfg.secretsPath}/roles/${role}.age";
           target = "/run/aegis/roles/${role}";
           user = "root";
           group = "root";

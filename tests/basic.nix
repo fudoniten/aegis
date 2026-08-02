@@ -18,7 +18,7 @@ let
     echo "super-secret-value" | age -r "$(cat ${testKeyPair}/pubkey.txt)" -a -o $out/secret.age
   '';
 
-in pkgs.nixosTest {
+in pkgs.testers.nixosTest {
   name = "aegis-basic";
 
   nodes.machine = { config, pkgs, lib, ... }: {

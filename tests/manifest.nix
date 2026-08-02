@@ -63,7 +63,7 @@ let
     EOF
   '';
 
-in pkgs.nixosTest {
+in pkgs.testers.nixosTest {
   name = "aegis-manifest";
 
   nodes.machine = { config, pkgs, lib, ... }: {

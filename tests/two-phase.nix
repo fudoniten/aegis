@@ -48,6 +48,7 @@ in pkgs.testers.nixosTest {
 
     aegis.secrets = {
       enable = true;
+      dryRun = false;
       masterKeyPath = "/var/lib/aegis/master-key";
 
       secrets = {

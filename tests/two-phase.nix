@@ -34,7 +34,7 @@ let
       echo "role-secret-data" | age -r "$(cat ${roleKeyPair}/pubkey.txt)" -a -o $out/role-secret.age
     '';
 
-in pkgs.nixosTest {
+in pkgs.testers.nixosTest {
   name = "aegis-two-phase";
 
   nodes.machine = { config, pkgs, lib, ... }: {

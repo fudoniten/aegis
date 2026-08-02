@@ -14,7 +14,7 @@ let
     echo "service-config-data" | age -r "$(cat ${testKeyPair}/pubkey.txt)" -a -o $out/config.age
   '';
 
-in pkgs.nixosTest {
+in pkgs.testers.nixosTest {
   name = "aegis-service-dependency";
 
   nodes.machine = { config, pkgs, lib, ... }: {

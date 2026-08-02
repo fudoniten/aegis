@@ -490,7 +490,10 @@ in {
         computed automatically. Only set this directly if you have a
         non-standard directory structure.
       '';
-      default = hostSecretsPath;
+      default = if cfg.secretsRepoPath != null then
+        "${cfg.secretsRepoPath}/build/hosts/${hostname}"
+      else
+        "/run/aegis";
       defaultText = literalExpression
         ''"''${secretsRepoPath}/build/hosts/''${networking.hostName}"'';
       example = "/path/to/aegis-secrets/build/hosts/myhost";

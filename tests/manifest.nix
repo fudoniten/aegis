@@ -6,11 +6,12 @@
 { pkgs, ... }:
 
 let
-  masterKey = pkgs.runCommand "master-keypair" { buildInputs = [ pkgs.age ]; } ''
-    mkdir -p $out
-    age-keygen -o $out/key.txt 2>/dev/null
-    age-keygen -y $out/key.txt > $out/pubkey.txt
-  '';
+  masterKey =
+    pkgs.runCommand "master-keypair" { buildInputs = [ pkgs.age ]; } ''
+      mkdir -p $out
+      age-keygen -o $out/key.txt 2>/dev/null
+      age-keygen -y $out/key.txt > $out/pubkey.txt
+    '';
 
   # A stand-in for deploy/hosts/<hostname>/, laid out exactly as the tools
   # write it, including a keytab carrying the legacy base64: wrapper.

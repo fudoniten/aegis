@@ -9,247 +9,324 @@ let
   stringPadRight = count: str:
     str + (strings.replicate (count - (stringLength str)) " ");
 
-  # Compute the host-specific secrets path
-  # If secretsRepoPath is set, derive the path; otherwise use secretsPath directly
-  hostSecretsPath = if cfg.secretsRepoPath != null then
-    "${cfg.secretsRepoPath}/build/hosts/${hostname}"
+  # Resolve the host's secrets directory.
+  #
+  # The generated output directory is called deploy/; build/ is the historical
+  # name and is still honoured so an un-migrated aegis-secrets keeps working.
+  repoHostPath = repoPath:
+    let
+      deployPath = "${repoPath}/deploy/hosts/${hostname}";
+      legacyPath = "${repoPath}/build/hosts/${hostname}";
+    in if builtins.pathExists deployPath then deployPath else legacyPath;
+
+  # Explicit secretsPath wins; otherwise derive from the repo.  Note the
+  # ordering: deriving `secretsPath`'s *default* from this value while this
+  # value read `cfg.secretsPath` was an infinite recursion whenever neither
+  # option was set, which is why the VM tests could never evaluate.
+  hostSecretsPath = if cfg.secretsPath != null then
+    cfg.secretsPath
+  else if cfg.secretsRepoPath != null then
+    repoHostPath cfg.secretsRepoPath
   else
-    cfg.secretsPath;
+    null;
 
-  # Load the secrets manifest from the build directory (if it exists)
-  # This is a plain TOML file that can be read at Nix evaluation time
-  manifestPath = "${hostSecretsPath}/secrets.toml";
-  manifestExists = builtins.pathExists manifestPath;
+  # The manifest is the single source of truth for what this host gets and
+  # where it goes.  It is plain TOML so it can be read at evaluation time.
+  manifestPath =
+    if hostSecretsPath == null then null else "${hostSecretsPath}/secrets.toml";
+  manifestExists = manifestPath != null && builtins.pathExists manifestPath;
 
-  # Parse the manifest, or return empty attrset if not found
   manifest = if manifestExists then
     builtins.fromTOML (builtins.readFile manifestPath)
   else
     { };
 
-  # Helper to get a nested attribute with a default
-  getOr = default: path: attrs:
+  # -------------------------------------------------------------------------
+  # Manifest -> normalised secret list
+  #
+  # Every kind of secret becomes the same shape, so there is exactly one unit
+  # generator.  `kind` only distinguishes the few behaviours that genuinely
+  # differ: SSH keys have a plaintext .pub sidecar, and legacy keytabs may
+  # carry a base64 wrapper.
+  # -------------------------------------------------------------------------
+
+  normaliseEntry = { name, kind, entry, defaultTarget ? null, defaultMode ? "0400" }: {
+    inherit name kind;
+    source = "${hostSecretsPath}/${entry.source}";
+    target = entry.target or defaultTarget;
+    user = entry.user or "root";
+    group = entry.group or "root";
+    mode = entry.mode or defaultMode;
+    encoding = entry.encoding or null;
+    phase = 1;
+    identity = cfg.masterKeyPath;
+  };
+
+  sshEntries = map (entry:
     let
-      go = path: attrs:
-        if path == [ ] then
-          attrs
-        else if attrs ? ${head path} then
-          go (tail path) attrs.${head path}
-        else
-          default;
-    in go path attrs;
+      targetDir = entry.target_dir or "/etc/ssh";
+      stem = entry.target or "ssh_host_${entry.type or "ed25519"}_key";
+    in (normaliseEntry {
+      name = "ssh-${entry.type or stem}";
+      kind = "ssh-host-key";
+      inherit entry;
+      defaultTarget = "${targetDir}/${stem}";
+      defaultMode = "0600";
+    }) // {
+      target = "${targetDir}/${stem}";
+      # The public key ships in the clear alongside the encrypted private key
+      pubSource = "${hostSecretsPath}/${
+          removeSuffix ".age" entry.source
+        }.pub";
+      pubTarget = "${targetDir}/${stem}.pub";
+      keyType = entry.type or null;
+    }) (manifest.ssh-host-keys or [ ]);
 
-  # Extract SSH host keys config from manifest
-  sshHostKeysManifest = getOr null [ "ssh-host-keys" ] manifest;
+  keytabEntries = optional (manifest ? keytab) (normaliseEntry {
+    name = "keytab";
+    kind = "plain";
+    entry = manifest.keytab;
+    defaultTarget = "/run/aegis/keytab";
+    defaultMode = "0600";
+  });
 
-  # Extract keytab config from manifest
-  keytabManifest = getOr null [ "keytab" ] manifest;
+  nexusEntries = optional (manifest ? nexus-key) (normaliseEntry {
+    name = "nexus-key";
+    kind = "plain";
+    entry = manifest.nexus-key;
+    defaultTarget = "/run/aegis/nexus-key";
+  });
 
-  # Extract nexus key config from manifest
-  nexusKeyManifest = getOr null [ "nexus-key" ] manifest;
+  extraEntries = mapAttrsToList (name: entry:
+    normaliseEntry {
+      name = "secret-${name}";
+      kind = "plain";
+      inherit entry;
+      defaultTarget = "/run/aegis/secrets/${name}";
+    }) (manifest.secrets or { });
 
-  # Extract roles list from manifest
-  rolesManifest = getOr [ ] [ "roles" ] manifest;
+  manifestRoles = manifest.roles or [ ];
 
-  # Extract extra secrets from manifest
-  secretsManifest = getOr { } [ "secrets" ] manifest;
+  roleEntries = map (role: {
+    name = "role-${role}";
+    kind = "plain";
+    source = "${hostSecretsPath}/roles/${role}.age";
+    target = "/run/aegis/roles/${role}";
+    user = "root";
+    group = "root";
+    mode = "0400";
+    encoding = null;
+    phase = 1;
+    identity = cfg.masterKeyPath;
+  }) cfg.roles;
 
-  # Compute actual target path (may be redirected in dry-run mode)
+  userKeyEntries = map (username: {
+    name = "user-key-${username}";
+    kind = "plain";
+    source = "${hostSecretsPath}/users/${username}/.key.age";
+    target = "/run/aegis/users/${username}/.key";
+    # Owned by the user: the phase-2 unit that consumes it runs as them, and
+    # a root-owned 0400 key in a 0750 root directory is unreadable to it.
+    user = username;
+    group = username;
+    mode = "0400";
+    encoding = null;
+    phase = 1;
+    identity = cfg.masterKeyPath;
+  }) cfg.users;
+
+  # Secrets declared directly in Nix, for anything the manifest cannot express
+  manualEntries = mapAttrsToList (name: secretCfg: {
+    inherit name;
+    kind = "plain";
+    source = toString secretCfg.source;
+    target = secretCfg.target;
+    user = secretCfg.user;
+    group = secretCfg.group;
+    mode = secretCfg.permissions;
+    encoding = null;
+    phase = secretCfg.phase;
+    identity = secretCfg.identity;
+  }) cfg.secrets;
+
+  allEntries = sshEntries ++ keytabEntries ++ nexusEntries ++ extraEntries
+    ++ roleEntries ++ userKeyEntries ++ manualEntries;
+
+  # -------------------------------------------------------------------------
+  # Decryption
+  # -------------------------------------------------------------------------
+
+  # In dry-run mode the whole tree is relocated under dryRunPath, preserving
+  # directory structure.  Flattening to the basename made secrets with the
+  # same basename in different directories silently overwrite each other.
   actualTarget = target:
-    if cfg.dryRun then "${cfg.dryRunPath}/${baseNameOf target}" else target;
+    if cfg.dryRun then "${cfg.dryRunPath}${target}" else target;
 
-  # Script to decrypt a secret with age
-  decryptScript = { name, source, target, identity, user, group, permissions }:
+  dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
+
+  # Legacy: material written before the tools became binary clean carries a
+  # `base64:` sentinel.  Nothing writes it any more, but a keytab encrypted by
+  # the old tooling still needs unwrapping, and the module used to ignore the
+  # manifest's `encoding` field entirely -- deploying the literal string
+  # "base64:AAAA..." instead of a keytab.
+  decodeCommand = encoding: path:
+    if encoding == "base64" then ''
+      case "$(${pkgs.coreutils}/bin/head -c 7 "${path}")" in
+        "base64:")
+          ${pkgs.coreutils}/bin/tail -c +8 "${path}" \
+            | ${pkgs.coreutils}/bin/base64 -d > "${path}.decoded"
+          ;;
+        *)
+          ${pkgs.coreutils}/bin/base64 -d < "${path}" > "${path}.decoded"
+          ;;
+      esac
+      mv "${path}.decoded" "${path}"
+    '' else
+      "";
+
+  mkDecryptScript = entry:
     let
-      realTarget = actualTarget target;
-      dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
-      logTarget = if cfg.dryRun then
-        "dry-run: ${realTarget} (would be: ${target})"
-      else
-        target;
-    in pkgs.writeShellScript "aegis-decrypt-${name}" ''
+      realTarget = actualTarget entry.target;
+      ownership = if cfg.dryRun then ''
+        echo "${dryRunPrefix}Would set: owner=${entry.user}:${entry.group} mode=${entry.mode} on ${entry.target}"
+        chmod 0400 "${realTarget}"
+      '' else ''
+        chown ${entry.user}:${entry.group} "${realTarget}"
+        chmod ${entry.mode} "${realTarget}"
+      '';
+    in pkgs.writeShellScript "aegis-decrypt-${entry.name}" ''
       set -euo pipefail
 
-      echo "${dryRunPrefix}Decrypting ${name} -> ${logTarget}"
+      echo "${dryRunPrefix}Decrypting ${entry.name} -> ${realTarget}"
 
-      # Create target directory if needed
       TARGET_DIR=$(dirname "${realTarget}")
       if [ ! -d "$TARGET_DIR" ]; then
         mkdir -p "$TARGET_DIR"
-        ${
-          if cfg.dryRun then
-            "# Dry-run: skipping chown/chmod on directory"
-          else ''
-            chown ${user}:${group} "$TARGET_DIR"
-            chmod 0750 "$TARGET_DIR"
-          ''
-        }
+        ${optionalString (!cfg.dryRun) ''
+          chown ${entry.user}:${entry.group} "$TARGET_DIR"
+          chmod 0750 "$TARGET_DIR"
+        ''}
       fi
 
-      # Remove old secret if it exists
-      rm -f "${realTarget}"
+      # Decrypt to a temporary file and move into place, so a failure leaves
+      # the previous secret intact rather than deleting it. A rebuild that
+      # cannot decrypt should not take the service down.
+      TMP=$(mktemp "${realTarget}.XXXXXX")
+      trap 'rm -f "$TMP"' EXIT
 
-      # Decrypt
       ${pkgs.age}/bin/age --decrypt \
-        --identity "${identity}" \
-        --output "${realTarget}" \
-        "${source}"
+        --identity "${entry.identity}" \
+        --output "$TMP" \
+        "${entry.source}"
 
-      # Set ownership and permissions
-      ${if cfg.dryRun then ''
-        # Dry-run: logging intended permissions instead of applying
-        echo "${dryRunPrefix}Would set: owner=${user}:${group} mode=${permissions} on ${target}"
-        chmod 0400 "${realTarget}"  # Secure the dry-run file at least
-      '' else ''
-        chown ${user}:${group} "${realTarget}"
-        chmod ${permissions} "${realTarget}"
+      ${decodeCommand entry.encoding "$TMP"}
+
+      mv "$TMP" "${realTarget}"
+      trap - EXIT
+
+      ${ownership}
+
+      ${optionalString (entry.kind == "ssh-host-key") ''
+        # Public key ships in the clear; keep it beside the private key so
+        # sshd and anything reading known_hosts sees a consistent pair.
+        install -m 0644 -o ${
+          if cfg.dryRun then "root" else entry.user
+        } "${entry.pubSource}" "${actualTarget entry.pubTarget}"
       ''}
 
-      ${if cfg.dryRun then ''
-        echo "${dryRunPrefix}Secret ${name} validated successfully (dry-run mode)"
-      '' else
-        ""}
+      ${optionalString cfg.dryRun ''
+        echo "${dryRunPrefix}Secret ${entry.name} validated successfully (dry-run mode)"
+      ''}
     '';
 
-  # Script to remove a secret
-  removeScript = name: target:
-    let realTarget = actualTarget target;
-    in pkgs.writeShellScript "aegis-remove-${name}" ''
-      rm -f "${realTarget}"
-    '';
+  mkSecretService = entry: {
+    description = "Aegis: decrypt ${entry.name}${
+        optionalString cfg.dryRun " (DRY-RUN)"
+      }";
+    wantedBy = [ "aegis-phase${toString entry.phase}.target" ];
+    before = [ "aegis-phase${toString entry.phase}.target" ];
+    after = if entry.phase == 1 then
+      [ "local-fs.target" ]
+    else
+      [ "aegis-phase1.target" ];
+    requires = if entry.phase == 1 then
+      [ "local-fs.target" ]
+    else
+      [ "aegis-phase1.target" ];
 
-  # Script to install an SSH host key pair (decrypt privkey + copy pubkey)
-  sshKeyPairScript =
-    { keyType, sourceDir, targetDir, identity, user, group, privMode }:
+    restartIfChanged = true;
+    # No ExecStop that removes the target: with restartIfChanged, a switch
+    # would delete the live secret and, if the new unit failed to start, never
+    # put it back. The decrypt script replaces the file atomically instead.
+    stopIfChanged = false;
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = mkDecryptScript entry;
+    };
+  };
+
+  # -------------------------------------------------------------------------
+  # User secrets (phase 2)
+  # -------------------------------------------------------------------------
+
+  userSecretsScript = username:
     let
-      privSource = "${sourceDir}/ssh_host_${keyType}_key.age";
-      pubSource = "${sourceDir}/ssh_host_${keyType}_key.pub";
-      privTarget = "${targetDir}/ssh_host_${keyType}_key";
-      pubTarget = "${targetDir}/ssh_host_${keyType}_key.pub";
-      realPrivTarget = actualTarget privTarget;
-      realPubTarget = actualTarget pubTarget;
-      dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
-    in pkgs.writeShellScript "aegis-ssh-key-${keyType}" ''
-      set -euo pipefail
-
-      echo "${dryRunPrefix}Installing SSH host key ${keyType}"
-
-      TARGET_DIR="${
-        if cfg.dryRun then cfg.dryRunPath else targetDir
-      }"
-      if [ ! -d "$TARGET_DIR" ]; then
-        mkdir -p "$TARGET_DIR"
-        ${
-          if cfg.dryRun then
-            "# Dry-run: skipping chown/chmod on directory"
-          else ''
-            chown ${user}:${group} "$TARGET_DIR"
-            chmod 0750 "$TARGET_DIR"
-          ''
-        }
-      fi
-
-      # Decrypt private key
-      rm -f "${realPrivTarget}"
-      ${pkgs.age}/bin/age --decrypt \
-        --identity "${identity}" \
-        --output "${realPrivTarget}" \
-        "${privSource}"
-      ${
-        if cfg.dryRun then ''
-          chmod 0400 "${realPrivTarget}"
-          echo "${dryRunPrefix}Would set: owner=${user}:${group} mode=${privMode} on ${privTarget}"
-        '' else ''
-          chown ${user}:${group} "${realPrivTarget}"
-          chmod ${privMode} "${realPrivTarget}"
-        ''
-      }
-
-      # Install public key
-      rm -f "${realPubTarget}"
-      cp "${pubSource}" "${realPubTarget}"
-      ${
-        if cfg.dryRun then ''
-          chmod 0444 "${realPubTarget}"
-          echo "${dryRunPrefix}Would set: owner=${user}:${group} mode=0644 on ${pubTarget}"
-        '' else ''
-          chown ${user}:${group} "${realPubTarget}"
-          chmod 0644 "${realPubTarget}"
-        ''
-      }
-    '';
-
-  # Script to decrypt all user secrets from manifest
-  # This reads the manifest to get actual secret names and targets
-  userSecretsScript = username: userSecretsPath:
-    let
-      dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
-      baseTarget = if cfg.dryRun then
-        "${cfg.dryRunPath}/users/${username}"
-      else
-        "/run/aegis/users/${username}";
+      userSecretsPath = "${hostSecretsPath}/users/${username}";
+      baseTarget = actualTarget "/run/aegis/users/${username}";
     in pkgs.writeShellScript "aegis-user-secrets-${username}" ''
       set -euo pipefail
 
-      USER_KEY="/run/aegis/users/${username}/.key"
+      USER_KEY="${actualTarget "/run/aegis/users/${username}/.key"}"
       MANIFEST_ENC="${userSecretsPath}/manifest.age"
       SECRETS_DIR="${userSecretsPath}/secrets"
       TARGET_DIR="${baseTarget}"
 
       echo "${dryRunPrefix}Decrypting secrets for user ${username}"
 
-      # Check user key exists
-      if [ ! -f "$USER_KEY" ]; then
-        echo "ERROR: User deployment key not found: $USER_KEY"
+      if [ ! -r "$USER_KEY" ]; then
+        echo "ERROR: User deployment key not readable: $USER_KEY"
         exit 1
       fi
 
-      # Create target directories
-      mkdir -p "$TARGET_DIR/env"
-      mkdir -p "$TARGET_DIR/files"
-      ${if cfg.dryRun then
-        ""
-      else ''
-        chown ${username}:${username} "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
-        chmod 0700 "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
-      ''}
+      mkdir -p "$TARGET_DIR/env" "$TARGET_DIR/files"
+      chown ${username}:${username} "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
+      chmod 0700 "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
 
-      # Decrypt manifest to temp file
-      MANIFEST_TMP=$(mktemp)
-      trap "rm -f $MANIFEST_TMP" EXIT
-
-      if [ -f "$MANIFEST_ENC" ]; then
-        ${pkgs.age}/bin/age --decrypt \
-          --identity "$USER_KEY" \
-          --output "$MANIFEST_TMP" \
-          "$MANIFEST_ENC"
-      else
+      if [ ! -f "$MANIFEST_ENC" ]; then
         echo "WARNING: No manifest found at $MANIFEST_ENC"
         exit 0
       fi
 
-      # Parse manifest and decrypt each secret
+      MANIFEST_TMP=$(mktemp)
+      trap 'rm -f "$MANIFEST_TMP"' EXIT
+
+      ${pkgs.age}/bin/age --decrypt \
+        --identity "$USER_KEY" \
+        --output "$MANIFEST_TMP" \
+        "$MANIFEST_ENC"
+
       # Manifest format (YAML):
       #   secrets:
       #     <hashed_name>.age:
       #       name: <actual_name>
       #       type: env|file
       #       target: <optional target path for files>
-
-      ${pkgs.yq-go}/bin/yq e '.secrets | to_entries | .[] | [.key, .value.name, .value.type, .value.target // ""] | @tsv' "$MANIFEST_TMP" | \
+      ${pkgs.yq-go}/bin/yq e \
+        '.secrets | to_entries | .[] | [.key, .value.name, .value.type, .value.target // ""] | @tsv' \
+        "$MANIFEST_TMP" | \
       while IFS=$'\t' read -r hashed_file actual_name secret_type target_path; do
         SOURCE_FILE="$SECRETS_DIR/$hashed_file"
-        
+
         if [ ! -f "$SOURCE_FILE" ]; then
           echo "WARNING: Secret file not found: $SOURCE_FILE (for $actual_name)"
           continue
         fi
-        
-        # Determine target based on type
+
         if [ "$secret_type" = "env" ]; then
           TARGET_FILE="$TARGET_DIR/env/$actual_name"
         elif [ "$secret_type" = "file" ] && [ -n "$target_path" ]; then
-          # For files with explicit target, use that (but redirect in dry-run)
           ${
             if cfg.dryRun then ''
               TARGET_FILE="$TARGET_DIR/files/$actual_name"
@@ -261,32 +338,25 @@ let
         else
           TARGET_FILE="$TARGET_DIR/files/$actual_name"
         fi
-        
-        # Create target directory if needed
-        TARGET_PARENT=$(dirname "$TARGET_FILE")
-        mkdir -p "$TARGET_PARENT"
-        
-        # Decrypt
+
+        mkdir -p "$(dirname "$TARGET_FILE")"
+
         echo "${dryRunPrefix}Decrypting $actual_name -> $TARGET_FILE"
         ${pkgs.age}/bin/age --decrypt \
           --identity "$USER_KEY" \
           --output "$TARGET_FILE" \
           "$SOURCE_FILE"
-        
-        ${
-          if cfg.dryRun then ''
-            chmod 0400 "$TARGET_FILE"
-          '' else ''
-            chown ${username}:${username} "$TARGET_FILE"
-            chmod 0400 "$TARGET_FILE"
-          ''
-        }
+
+        chown ${username}:${username} "$TARGET_FILE"
+        chmod 0400 "$TARGET_FILE"
       done
 
       echo "${dryRunPrefix}User secrets for ${username} decrypted successfully"
     '';
 
-  # Generate systemd service for user secrets (phase 2)
+  # Runs as root and chowns to the user, rather than running as the user.
+  # Running as the user cannot work: the unit has to create directories under
+  # /run/aegis/users, which root owns.
   mkUserSecretsService = username: {
     description = "Aegis: decrypt secrets for user ${username}${
         optionalString cfg.dryRun " (DRY-RUN)"
@@ -296,85 +366,17 @@ let
     after = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
     requires = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
 
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      ExecStart =
-        userSecretsScript username "${cfg.secretsPath}/users/${username}";
-    } // (if cfg.dryRun then
-      { }
-    else {
-      # Run as the user for proper ownership (in production mode)
-      User = username;
-      Group = username;
-    });
-  };
-
-  # Generate a systemd service for a secret
-  mkSecretService = name: secretCfg: {
-    description = "Aegis: decrypt ${name}";
-    wantedBy = [ "aegis-phase${toString secretCfg.phase}.target" ];
-    before = [ "aegis-phase${toString secretCfg.phase}.target" ];
-    after = if secretCfg.phase == 1 then
-      [ "local-fs.target" ]
-    else
-      [ "aegis-phase1.target" ];
-    requires = if secretCfg.phase == 1 then
-      [ "local-fs.target" ]
-    else
-      [ "aegis-phase1.target" ];
-
     restartIfChanged = true;
+    stopIfChanged = false;
 
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      ExecStart = decryptScript {
-        inherit name;
-        source = secretCfg.source;
-        target = secretCfg.target;
-        identity = secretCfg.identity;
-        user = secretCfg.user;
-        group = secretCfg.group;
-        permissions = secretCfg.permissions;
-      };
-      ExecStop = removeScript name secretCfg.target;
+      ExecStart = userSecretsScript username;
     };
   };
 
-  # Generate a systemd service for an SSH host key pair
-  mkSshKeyPairService = keyType: sshCfg: {
-    description = "Aegis: install SSH host key ${keyType}";
-    wantedBy = [ "aegis-phase1.target" ];
-    before = [ "aegis-phase1.target" ];
-    after = [ "local-fs.target" ];
-    requires = [ "local-fs.target" ];
-
-    restartIfChanged = true;
-
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      ExecStart = sshKeyPairScript {
-        inherit keyType;
-        sourceDir = sshCfg.sourceDir;
-        targetDir = sshCfg.targetDir;
-        identity = sshCfg.identity;
-        user = sshCfg.user;
-        group = sshCfg.group;
-        privMode = sshCfg.privMode;
-      };
-      ExecStop =
-        let
-          privTarget = "${sshCfg.targetDir}/ssh_host_${keyType}_key";
-          pubTarget = "${sshCfg.targetDir}/ssh_host_${keyType}_key.pub";
-        in pkgs.writeShellScript "aegis-remove-ssh-key-${keyType}" ''
-          rm -f "${actualTarget privTarget}" "${actualTarget pubTarget}"
-        '';
-    };
-  };
-
-  # Secret options submodule
+  # Secret options submodule (manual configuration)
   secretOpts = { name, ... }: {
     options = {
       source = mkOption {
@@ -437,16 +439,17 @@ in {
 
     dryRun = mkOption {
       type = types.bool;
-      default = true;
+      default = false;
       description = ''
-        Enable dry-run mode for safe migration testing.
+        Decrypt to a parallel tree under dryRunPath instead of the real
+        targets, for migration testing.
 
-        In dry-run mode:
-        - Secrets are decrypted to a separate directory (dryRunPath)
-        - Ownership/permissions are logged but not applied
-        - Services report success but don't affect production paths
+        Ownership and permissions are logged rather than applied, and no
+        production path is touched.
 
-        Set to false for production deployment.
+        Note this is NOT a safe default: services ordered after
+        aegis-secrets.target still start, but find no secrets where they
+        expect them. Enable it deliberately, verify, then turn it off.
       '';
     };
 
@@ -454,21 +457,22 @@ in {
       type = types.str;
       default = "/run/aegis-dry-run";
       description = ''
-        Directory for dry-run decryption output.
-        Only used when dryRun = true.
+        Root of the dry-run output tree. Targets are reproduced underneath it
+        with their full path, so /etc/ssh/ssh_host_ed25519_key lands at
+        ''${dryRunPath}/etc/ssh/ssh_host_ed25519_key.
       '';
     };
 
     secretsRepoPath = mkOption {
       type = types.nullOr types.path;
       description = ''
-        Path to the aegis-secrets repository or its build output.
+        Path to the aegis-secrets repository.
 
-        When set, secretsPath is automatically computed as:
-          ''${secretsRepoPath}/build/hosts/''${networking.hostName}
+        The host's directory is found automatically as
+          ''${secretsRepoPath}/deploy/hosts/''${networking.hostName}
+        falling back to build/ for repositories that have not been migrated.
 
-        This is the recommended way to configure aegis - just point to the
-        repo and it will find the right host's secrets automatically.
+        This is the recommended way to configure aegis.
 
         Example (in a flake):
           aegis.secrets = {
@@ -482,21 +486,28 @@ in {
     };
 
     secretsPath = mkOption {
-      type = types.path;
+      type = types.nullOr types.path;
       description = ''
-        Path to the aegis-secrets build output for this specific host.
+        Path to this specific host's secrets directory.
 
         Usually you should set secretsRepoPath instead and let this be
-        computed automatically. Only set this directly if you have a
-        non-standard directory structure.
+        computed as
+          ''${secretsRepoPath}/deploy/hosts/''${networking.hostName}
+        Only set this directly if you have a non-standard layout, or are
+        supplying secrets from somewhere other than an aegis-secrets repo.
       '';
-      default = if cfg.secretsRepoPath != null then
-        "${cfg.secretsRepoPath}/build/hosts/${hostname}"
-      else
-        "/run/aegis";
+      default = null;
       defaultText = literalExpression
-        ''"''${secretsRepoPath}/build/hosts/''${networking.hostName}"'';
-      example = "/path/to/aegis-secrets/build/hosts/myhost";
+        ''derived from secretsRepoPath, or null'';
+      example = "/path/to/aegis-secrets/deploy/hosts/myhost";
+    };
+
+    resolvedSecretsPath = mkOption {
+      type = types.nullOr types.str;
+      description = "The host secrets directory actually in use (read-only).";
+      default = if hostSecretsPath == null then null else toString hostSecretsPath;
+      defaultText = literalExpression "secretsPath, or derived from secretsRepoPath";
+      readOnly = true;
     };
 
     masterKeyPath = mkOption {
@@ -517,55 +528,24 @@ in {
 
     secrets = mkOption {
       type = types.attrsOf (types.submodule secretOpts);
-      description = "Secrets to decrypt for this host.";
+      description = ''
+        Extra secrets declared directly in Nix.
+
+        Most secrets should come from the manifest instead; this is an escape
+        hatch for anything it cannot express.
+      '';
       default = { };
-    };
-
-    # Convenience options for common secret types
-    sshHostKeys = {
-      enable = mkEnableOption "SSH host key secrets (for OpenSSH server)";
-
-      keyTypes = mkOption {
-        type = types.listOf types.str;
-        description = ''
-          SSH key types to install.
-
-          For each type, expects two files in secretsPath:
-            ssh_host_''${type}_key.age  (encrypted private key)
-            ssh_host_''${type}_key.pub  (plaintext public key)
-        '';
-        default = [ ];
-        example = [ "ed25519" "rsa" ];
-      };
-
-      targetDir = mkOption {
-        type = types.str;
-        description = "Directory where decrypted SSH host keys are placed.";
-        default = "/etc/ssh";
-      };
-    };
-
-    keytab = {
-      enable = mkEnableOption "Kerberos keytab secret";
-
-      source = mkOption {
-        type = types.nullOr types.path;
-        description = "Path to encrypted keytab file.";
-        default = null;
-      };
-
-      target = mkOption {
-        type = types.str;
-        description = "Where to place the decrypted keytab.";
-        default = "/run/aegis/keytab";
-      };
     };
 
     roles = mkOption {
       type = types.listOf types.str;
-      description =
-        "Roles this host has (e.g., kdc, dns). Role keys will be decrypted from roles/<role>.age inside the host secrets directory. Defaults to the roles list in secrets.toml if present.";
-      default = rolesManifest;
+      description = ''
+        Roles this host has (e.g., kdc, dns). Role keys are decrypted from
+        roles/<role>.age inside the host secrets directory. Defaults to the
+        roles list in secrets.toml.
+      '';
+      default = manifestRoles;
+      defaultText = literalExpression "the roles list from secrets.toml";
       example = [ "kdc" "dns" ];
     };
 
@@ -575,9 +555,29 @@ in {
       default = [ ];
     };
 
+    manageSshd = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Order sshd after aegis-phase1.target when the manifest supplies SSH
+        host keys.
+
+        Without this there is no ordering edge between them: sshd is wantedBy
+        multi-user.target and so are the decryption units, so sshd can start
+        before its host keys exist.
+      '';
+    };
+
+    verbose = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Print the list of secrets configured for this host at evaluation time.
+      '';
+    };
+
     # =========================================================================
-    # Manifest data (read-only, loaded from secrets.toml)
-    # These can be referenced in NixOS config to get target paths etc.
+    # Manifest data (read-only), for reference from other NixOS config
     # =========================================================================
 
     manifest = {
@@ -585,215 +585,78 @@ in {
         type = types.bool;
         description = "Whether a secrets.toml manifest was found and loaded.";
         default = manifestExists;
+        defaultText = literalExpression "true if secrets.toml exists";
+        readOnly = true;
+      };
+
+      path = mkOption {
+        type = types.nullOr types.str;
+        description = "Path the manifest was read from, if any.";
+        default = if manifestPath == null then null else toString manifestPath;
+        defaultText = literalExpression "''${secretsPath}/secrets.toml";
         readOnly = true;
       };
 
       sshHostKeys = mkOption {
-        type = types.nullOr (types.listOf (types.submodule {
-          options = {
-            type = mkOption {
-              type = types.str;
-              description = "SSH key type (e.g. ed25519, rsa)";
-            };
-            targetDir = mkOption {
-              type = types.str;
-              description = "Target directory for SSH keys";
-            };
-            user = mkOption {
-              type = types.str;
-              description = "Owner user";
-            };
-            group = mkOption {
-              type = types.str;
-              description = "Owner group";
-            };
-            mode = mkOption {
-              type = types.str;
-              description = "File permissions for private keys";
-            };
-          };
-        }));
-        description = "SSH host keys configuration from manifest.";
-        default = if sshHostKeysManifest != null then
-          map (entry: {
-            type = entry.type;
-            targetDir = entry.target_dir or "/etc/ssh";
-            user = entry.user or "root";
-            group = entry.group or "root";
-            mode = entry.mode or "0600";
-          }) sshHostKeysManifest
-        else
-          null;
+        type = types.listOf (types.attrsOf types.anything);
+        description = ''
+          SSH host keys from the manifest, with resolved target paths.
+          Useful for referring to a key path elsewhere in your config.
+        '';
+        default = map (entry: {
+          inherit (entry) target pubTarget user group mode;
+          type = entry.keyType;
+        }) sshEntries;
         readOnly = true;
       };
 
-      keytab = mkOption {
-        type = types.nullOr (types.submodule {
-          options = {
-            source = mkOption {
-              type = types.str;
-              description = "Source .age file";
-            };
-            target = mkOption {
-              type = types.str;
-              description = "Target path";
-            };
-            user = mkOption {
-              type = types.str;
-              description = "Owner user";
-            };
-            group = mkOption {
-              type = types.str;
-              description = "Owner group";
-            };
-            mode = mkOption {
-              type = types.str;
-              description = "File permissions";
-            };
-            encoding = mkOption {
-              type = types.nullOr types.str;
-              description = "Encoding (e.g., base64)";
-            };
-          };
-        });
-        description = "Kerberos keytab configuration from manifest.";
-        default = if keytabManifest != null then {
-          source = keytabManifest.source or "keytab.age";
-          target = keytabManifest.target or "/etc/krb5.keytab";
-          user = keytabManifest.user or "root";
-          group = keytabManifest.group or "root";
-          mode = keytabManifest.mode or "0600";
-          encoding = keytabManifest.encoding or null;
-        } else
-          null;
-        readOnly = true;
-      };
-
-      nexusKey = mkOption {
-        type = types.nullOr (types.submodule {
-          options = {
-            source = mkOption {
-              type = types.str;
-              description = "Source .age file";
-            };
-            target = mkOption {
-              type = types.str;
-              description = "Target path";
-            };
-            user = mkOption {
-              type = types.str;
-              description = "Owner user";
-            };
-            group = mkOption {
-              type = types.str;
-              description = "Owner group";
-            };
-            mode = mkOption {
-              type = types.str;
-              description = "File permissions";
-            };
-          };
-        });
-        description = "Nexus DDNS key configuration from manifest.";
-        default = if nexusKeyManifest != null then {
-          source = nexusKeyManifest.source or "nexus-key.age";
-          target = nexusKeyManifest.target or "/run/aegis/nexus-key";
-          user = nexusKeyManifest.user or "root";
-          group = nexusKeyManifest.group or "root";
-          mode = nexusKeyManifest.mode or "0400";
-        } else
-          null;
-        readOnly = true;
-      };
-
-      secrets = mkOption {
-        type = types.attrsOf (types.submodule {
-          options = {
-            source = mkOption {
-              type = types.str;
-              description = "Source .age file";
-            };
-            target = mkOption {
-              type = types.str;
-              description = "Target path";
-            };
-            user = mkOption {
-              type = types.str;
-              description = "Owner user";
-            };
-            group = mkOption {
-              type = types.str;
-              description = "Owner group";
-            };
-            mode = mkOption {
-              type = types.str;
-              description = "File permissions";
-            };
-          };
-        });
-        description = "Extra secrets configuration from manifest.";
-        default = mapAttrs (name: secretData: {
-          source = secretData.source or "secrets/${name}.age";
-          target = secretData.target or "/run/aegis/secrets/${name}";
-          user = secretData.user or "root";
-          group = secretData.group or "root";
-          mode = secretData.mode or "0400";
-        }) secretsManifest;
+      targets = mkOption {
+        type = types.attrsOf types.str;
+        description = ''
+          Map of secret name to the path it is decrypted to. Use this instead
+          of hardcoding paths in service configuration.
+        '';
+        default = listToAttrs
+          (map (entry: nameValuePair entry.name entry.target) allEntries);
         readOnly = true;
       };
 
       roles = mkOption {
         type = types.listOf types.str;
         description = "Roles declared in secrets.toml for this host.";
-        default = rolesManifest;
+        default = manifestRoles;
         readOnly = true;
       };
-    };
-
-    # Auto-configure from manifest
-    autoConfigureFromManifest = mkOption {
-      type = types.bool;
-      description = ''
-        Automatically configure secrets from the manifest file.
-        When enabled, secrets defined in secrets.toml will be automatically
-        set up for decryption without manual configuration.
-      '';
-      default = false;
-    };
-
-    verbose = mkOption {
-      type = types.bool;
-      default = false;
-      description = ''
-        Enable verbose output at Nix evaluation time.
-        When enabled, prints the list of secret names being configured for this host.
-      '';
     };
   };
 
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = !(cfg.sshHostKeys.enable && cfg.sshHostKeys.keyTypes == [ ]);
+        assertion = manifestExists || cfg.secrets != { };
         message = ''
-          aegis.secrets.sshHostKeys.enable is true but no key types are configured.
-          Set aegis.secrets.sshHostKeys.keyTypes (e.g. [ "ed25519" "rsa" ]) or disable sshHostKeys.
+          Aegis is enabled for ${hostname} but there are no secrets to manage.
+
+          ${
+            if manifestPath == null then
+              "Neither secretsRepoPath nor secretsPath is set, so there is nowhere to read a manifest from."
+            else
+              "No manifest was found at ${manifestPath}."
+          }
+
+          Either the host has not been built yet (run 'aegis build' in your
+          aegis-secrets repo), or secretsRepoPath points somewhere unexpected.
         '';
       }
       {
-        assertion =
-          !(cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null
-            && cfg.manifest.sshHostKeys == [ ]);
+        assertion = !(cfg.users != [ ] && !manifestExists);
         message = ''
-          The secrets.toml manifest for ${hostname} has an ssh-host-keys section
-          but it is empty. No SSH host key services would be created.
-          Add entries with a type attribute to the [[ssh-host-keys]] section in secrets.toml,
-          e.g.: [[ssh-host-keys]] / type = "ed25519"
+          aegis.secrets.users is set for ${hostname} but no manifest was found,
+          so there are no user deployment keys to decrypt.
         '';
       }
     ];
 
-    # Warn loudly if dry-run mode is enabled; list secrets if verbose
     warnings = optionals cfg.dryRun [''
       ╔═══════════════════════════════════════════════════════════════════╗
       ║                    AEGIS DRY-RUN MODE ENABLED                     ║
@@ -801,43 +664,31 @@ in {
       ║  Secrets are being decrypted to ${stringPadRight 34 cfg.dryRunPath}║
       ║  for testing purposes only. Production paths are NOT affected.    ║
       ║                                                                   ║
+      ║  Services depending on aegis-secrets.target WILL start, and will  ║
+      ║  not find their secrets. Do not leave this enabled.               ║
+      ║                                                                   ║
       ║  To deploy secrets for real, set:                                 ║
       ║    aegis.secrets.dryRun = false;                                  ║
       ╚═══════════════════════════════════════════════════════════════════╝
-    ''] ++ optionals cfg.verbose (let
-      sshHostKeyEnabled =
-        (cfg.sshHostKeys.enable && cfg.sshHostKeys.keyTypes != [ ]);
-      allSecretNames = unique ((attrNames cfg.secrets)
-        ++ optionals sshHostKeyEnabled [ "ssh-host-keys" ]
-        ++ optionals (cfg.keytab.enable && cfg.keytab.source != null)
-        [ "keytab" ] ++ map (role: "role-${role}") cfg.roles
-        ++ map (user: "user-key-${user}") cfg.users
-        ++ map (user: "user-secrets-${user}") cfg.users ++ optionals
-        (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null
-          && cfg.manifest.sshHostKeys != [ ])
-        [ "ssh-host-keys" ] ++ optionals
-        (cfg.autoConfigureFromManifest && cfg.manifest.keytab != null)
-        [ "keytab" ] ++ optionals
-        (cfg.autoConfigureFromManifest && cfg.manifest.nexusKey != null)
-        [ "nexus-key" ] ++ optionals cfg.autoConfigureFromManifest
-        (attrNames cfg.manifest.secrets));
-    in [''
+    ''] ++ optionals (!manifestExists && cfg.secrets != { }) [''
+      Aegis [${hostname}]: no manifest found; using only the ${
+        toString (length (attrNames cfg.secrets))
+      } secret(s) declared in Nix.
+    ''] ++ optionals cfg.verbose [''
       Aegis [${hostname}]: ${
-        toString (length allSecretNames)
+        toString (length allEntries)
       } secret(s) configured for this host:
-      ${concatMapStringsSep "\n" (name: "  - ${name}") allSecretNames}
-    '']);
+      ${
+        concatMapStringsSep "\n"
+        (entry: "  - ${entry.name} -> ${entry.target}") allEntries
+      }
+    ''];
 
-    # Ensure /run/aegis exists (and dry-run path if enabled)
     systemd.tmpfiles.rules = [
       "d /run/aegis 0755 root root - -"
       "d /run/aegis/users 0755 root root - -"
       "d /run/aegis/roles 0755 root root - -"
-    ] ++ optionals cfg.dryRun [
-      "d ${cfg.dryRunPath} 0755 root root - -"
-      "d ${cfg.dryRunPath}/users 0755 root root - -"
-      "d ${cfg.dryRunPath}/roles 0755 root root - -"
-    ];
+    ] ++ optionals cfg.dryRun [ "d ${cfg.dryRunPath} 0755 root root - -" ];
 
     # Phase 1 target - host secrets decrypted with master key
     systemd.targets.aegis-phase1 = {
@@ -868,144 +719,19 @@ in {
       requires = [ "aegis-phase2.target" ];
     };
 
-    # Generate services for all configured secrets
-    systemd.services = let
-      # User-defined secrets (manual configuration)
-      secretServices = mapAttrs' (name: secretCfg:
-        nameValuePair "aegis-secret-${name}" (mkSecretService name secretCfg))
-        cfg.secrets;
-
-      # SSH host keys for OpenSSH (one service per key type)
-      sshHostKeyEnabled =
-        cfg.sshHostKeys.enable && cfg.sshHostKeys.keyTypes != [ ];
-
-      sshKeyService = optionalAttrs sshHostKeyEnabled
-        (listToAttrs (map (keyType: {
-          name = "aegis-ssh-host-key-${keyType}";
-          value = mkSshKeyPairService keyType {
-            sourceDir = "${cfg.secretsPath}/ssh";
-            targetDir = cfg.sshHostKeys.targetDir;
-            user = "root";
-            group = "root";
-            privMode = "0600";
-            identity = cfg.masterKeyPath;
-          };
-        }) cfg.sshHostKeys.keyTypes));
-
-      # Keytab (if enabled manually)
-      keytabService =
-        optionalAttrs (cfg.keytab.enable && cfg.keytab.source != null) {
-          aegis-keytab = mkSecretService "keytab" {
-            source = cfg.keytab.source;
-            target = cfg.keytab.target;
-            user = "root";
-            group = "root";
-            permissions = "0400";
-            phase = 1;
-            identity = cfg.masterKeyPath;
-          };
+    systemd.services = listToAttrs (map (entry:
+      nameValuePair "aegis-${entry.name}" (mkSecretService entry)) allEntries)
+      // listToAttrs (map (username:
+        nameValuePair "aegis-user-secrets-${username}"
+        (mkUserSecretsService username)) cfg.users)
+      # sshd must not start before the keys it identifies itself with exist.
+      // optionalAttrs (cfg.manageSshd && sshEntries != [ ] && !cfg.dryRun) {
+        sshd = {
+          after = [ "aegis-phase1.target" ];
+          requires = [ "aegis-phase1.target" ];
         };
+      };
 
-      # Role key services (phase 1 - decrypt with master key)
-      roleKeyServices = listToAttrs (map (role: {
-        name = "aegis-role-${role}";
-        value = mkSecretService "role-${role}" {
-          source = "${cfg.secretsPath}/roles/${role}.age";
-          target = "/run/aegis/roles/${role}";
-          user = "root";
-          group = "root";
-          permissions = "0400";
-          phase = 1;
-          identity = cfg.masterKeyPath;
-        };
-      }) cfg.roles);
-
-      # User deployment key services (phase 1 - decrypt with master key)
-      userKeyServices = listToAttrs (map (user: {
-        name = "aegis-user-key-${user}";
-        value = mkSecretService "user-key-${user}" {
-          source = "${cfg.secretsPath}/users/${user}/.key.age";
-          target = "/run/aegis/users/${user}/.key";
-          user = "root";
-          group = "root";
-          permissions = "0400";
-          phase = 1;
-          identity = cfg.masterKeyPath;
-        };
-      }) cfg.users);
-
-      # User secrets services (phase 2 - decrypt with user deployment key)
-      # These read the manifest and decrypt each secret
-      userSecretsServices = listToAttrs (map (user: {
-        name = "aegis-user-secrets-${user}";
-        value = mkUserSecretsService user;
-      }) cfg.users);
-
-      # =======================================================================
-      # Auto-configured services from manifest
-      # =======================================================================
-
-      # SSH host keys from manifest
-      manifestSshService = optionalAttrs
-        (cfg.autoConfigureFromManifest && cfg.manifest.sshHostKeys != null)
-        (listToAttrs (map (entry: {
-          name = "aegis-ssh-host-key-${entry.type}";
-          value = mkSshKeyPairService entry.type {
-            sourceDir = "${cfg.secretsPath}/ssh";
-            targetDir = entry.targetDir;
-            user = entry.user;
-            group = entry.group;
-            privMode = entry.mode;
-            identity = cfg.masterKeyPath;
-          };
-        }) cfg.manifest.sshHostKeys));
-
-      # Keytab from manifest
-      manifestKeytabService = optionalAttrs
-        (cfg.autoConfigureFromManifest && cfg.manifest.keytab != null) {
-          aegis-keytab = mkSecretService "keytab" {
-            source = "${cfg.secretsPath}/${cfg.manifest.keytab.source}";
-            target = cfg.manifest.keytab.target;
-            user = cfg.manifest.keytab.user;
-            group = cfg.manifest.keytab.group;
-            permissions = cfg.manifest.keytab.mode;
-            phase = 1;
-            identity = cfg.masterKeyPath;
-          };
-        };
-
-      # Nexus key from manifest
-      manifestNexusService = optionalAttrs
-        (cfg.autoConfigureFromManifest && cfg.manifest.nexusKey != null) {
-          aegis-nexus-key = mkSecretService "nexus-key" {
-            source = "${cfg.secretsPath}/${cfg.manifest.nexusKey.source}";
-            target = cfg.manifest.nexusKey.target;
-            user = cfg.manifest.nexusKey.user;
-            group = cfg.manifest.nexusKey.group;
-            permissions = cfg.manifest.nexusKey.mode;
-            phase = 1;
-            identity = cfg.masterKeyPath;
-          };
-        };
-
-      # Extra secrets from manifest
-      manifestSecretServices = optionalAttrs cfg.autoConfigureFromManifest
-        (mapAttrs' (name: secretManifest:
-          nameValuePair "aegis-secret-${name}" (mkSecretService name {
-            source = "${cfg.secretsPath}/${secretManifest.source}";
-            target = secretManifest.target;
-            user = secretManifest.user;
-            group = secretManifest.group;
-            permissions = secretManifest.mode;
-            phase = 1;
-            identity = cfg.masterKeyPath;
-          })) cfg.manifest.secrets);
-
-    in secretServices // sshKeyService // keytabService // roleKeyServices
-    // userKeyServices // userSecretsServices // manifestSshService
-    // manifestKeytabService // manifestNexusService // manifestSecretServices;
-
-    # Create group for secret access
     users.groups.aegis-secrets = { };
   };
 }

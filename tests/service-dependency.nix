@@ -28,6 +28,8 @@ in pkgs.testers.nixosTest {
 
     aegis.secrets = {
       enable = true;
+      # Explicit: dry-run redirects every target under dryRunPath, so these
+      # assertions would look for files that were never written there.
       dryRun = false;
       masterKeyPath = "/var/lib/aegis/master-key";
 

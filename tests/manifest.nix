@@ -70,6 +70,17 @@ in pkgs.testers.nixosTest {
   nodes.machine = { config, pkgs, lib, ... }: {
     imports = [ ../modules/secrets.nix ];
 
+    # sshd must really be enabled: the behaviour under test is NixOS's
+    # preStart generating a replacement key when hostKeys points at a missing
+    # file, which only happens for a configured, enabled server.
+    services.openssh = {
+      enable = true;
+      hostKeys = [{
+        path = "/etc/ssh/ssh_host_ed25519_key";
+        type = "ed25519";
+      }];
+    };
+
     users.groups.svcuser = { };
     users.users.svcuser = {
       isSystemUser = true;
@@ -114,9 +125,32 @@ in pkgs.testers.nixosTest {
     token = machine.succeed("cat /run/svc/token")
     assert "service-token-value" in token, f"unexpected content: {token!r}"
 
-    # --- sshd is ordered after the keys it needs
-    order = machine.succeed("systemctl show sshd.service -p After")
-    assert "aegis-phase1.target" in order, f"sshd not ordered after aegis: {order}"
+    # --- sshd depends on the units that decrypt its keys, not just the phase
+    # target. wantedBy is a weak dependency, so the target activates even when
+    # a key unit has failed.
+    after = machine.succeed("systemctl show sshd.service -p After")
+    requires = machine.succeed("systemctl show sshd.service -p Requires")
+    assert "aegis-ssh-ed25519.service" in after, f"sshd not ordered after key unit: {after}"
+    assert "aegis-ssh-ed25519.service" in requires, (
+        f"sshd only weakly depends on its host key: {requires}")
+
+    # --- and that dependency is load-bearing. With the key unit unable to run
+    # and the key absent, sshd must refuse to start rather than let NixOS's
+    # preStart mint a replacement identity. This is the failure mode that a
+    # target under /run makes reachable on every boot.
+    machine.succeed("systemctl stop sshd.service")
+    machine.succeed("systemctl mask aegis-ssh-ed25519.service")
+    machine.succeed("rm -f /etc/ssh/ssh_host_ed25519_key")
+
+    machine.fail("systemctl start sshd.service")
+    machine.fail("test -f /etc/ssh/ssh_host_ed25519_key")
+    print("sshd refused to start without its key, and generated nothing")
+
+    # ...and recovers cleanly once the key unit can run again
+    machine.succeed("systemctl unmask aegis-ssh-ed25519.service")
+    machine.succeed("systemctl start aegis-ssh-ed25519.service")
+    machine.succeed("systemctl start sshd.service")
+    machine.succeed("test -f /etc/ssh/ssh_host_ed25519_key")
 
     print("Manifest test passed!")
   '';

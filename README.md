@@ -102,7 +102,7 @@ Core module. Reads the manifest and generates a decryption unit per secret.
 | `secrets` | attrsOf secret | {} | Extra secrets declared in Nix |
 | `roles` | list of string | from manifest | Roles this host has |
 | `users` | list of string | [] | Users whose secrets to decrypt |
-| `manageSshd` | bool | true | Order sshd after `aegis-phase1.target` |
+| `manageSshd` | bool | true | Make sshd require the units that decrypt its host keys |
 | `dryRun` | bool | **false** | Decrypt to `dryRunPath` instead of real targets |
 | `verbose` | bool | false | List configured secrets at evaluation time |
 
@@ -159,8 +159,29 @@ systemd.services.myservice = {
 };
 ```
 
-sshd is wired automatically when the manifest supplies SSH host keys
-(`manageSshd`), because otherwise nothing orders it after its own keys.
+### OpenSSH
+
+When the manifest supplies SSH host keys, `manageSshd` (default true) makes
+sshd `Requires=` the units that decrypt them — not just the phase target.
+The distinction matters: decrypt units are `wantedBy` the target, which is a
+weak dependency, so the target activates even when one has failed. Depending
+on the units directly turns "sshd starts without its key" into "sshd does not
+start".
+
+Point sshd at the decrypted paths rather than hardcoding them, so a change to
+placement cannot drift out of sync:
+
+```nix
+services.openssh.hostKeys = map (k: { path = k.target; inherit (k) type; })
+  config.aegis.secrets.manifest.sshHostKeys;
+```
+
+**If your keys land under `/run`**, note that NixOS's sshd `preStart`
+generates a replacement for any `hostKeys` path that is missing, and tmpfs
+starts empty on every boot. The `Requires=` wiring above is what stops that
+from happening — if you set `manageSshd = false`, a failed decrypt will give
+the host a brand-new identity instead of refusing to start, breaking
+`known_hosts` and any SSHFP records.
 
 ## Secret Paths
 

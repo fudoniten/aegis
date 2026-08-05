@@ -152,6 +152,10 @@ let
   allEntries = sshEntries ++ keytabEntries ++ nexusEntries ++ extraEntries
     ++ roleEntries ++ userKeyEntries ++ manualEntries;
 
+  # Unit names of the SSH host key decrypt services, for sshd to depend on
+  # directly rather than via the phase target.
+  sshUnitNames = map (entry: "aegis-${entry.name}.service") sshEntries;
+
   # -------------------------------------------------------------------------
   # Decryption
   # -------------------------------------------------------------------------
@@ -495,7 +499,7 @@ in {
           ''${secretsRepoPath}/deploy/hosts/''${networking.hostName}
         Only set this directly if you have a non-standard layout, or are
         supplying secrets from somewhere other than an aegis-secrets repo.
-      ''';
+      '';
       default = null;
       defaultText = literalExpression
         ''derived from secretsRepoPath, or null'';
@@ -724,11 +728,26 @@ in {
       // listToAttrs (map (username:
         nameValuePair "aegis-user-secrets-${username}"
         (mkUserSecretsService username)) cfg.users)
-      # sshd must not start before the keys it identifies itself with exist.
+      # sshd must not start before the keys it identifies itself with exist,
+      # and must not start at all if decrypting them failed.
+      #
+      # Depending on aegis-phase1.target is not enough: the decrypt units are
+      # wantedBy it, which is a *weak* dependency, so the target activates even
+      # when a key unit has failed. sshd would then start with its key absent,
+      # and NixOS's sshd preStart generates a replacement for any hostKeys path
+      # that is missing -- silently changing the host's identity.
+      #
+      # That was survivable while keys lived in /etc/ssh, where the previous
+      # key persisted across the failure. With a target under /run it is not:
+      # tmpfs starts empty on every boot, so any failed decrypt mints a new
+      # identity and breaks known_hosts and SSHFP records.
+      #
+      # Requires= on the units themselves makes the failure mode "sshd does not
+      # start" instead of "sshd starts as somebody else".
       // optionalAttrs (cfg.manageSshd && sshEntries != [ ] && !cfg.dryRun) {
         sshd = {
-          after = [ "aegis-phase1.target" ];
-          requires = [ "aegis-phase1.target" ];
+          after = sshUnitNames;
+          requires = sshUnitNames;
         };
       };
 

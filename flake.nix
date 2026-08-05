@@ -6,13 +6,17 @@
   outputs = { self, nixpkgs, ... }: {
     # NixOS modules
     nixosModules = {
-      # Core secrets module
+      # Core secrets module: reads deploy/hosts/<host>/secrets.toml
       secrets = import ./modules/secrets.nix;
 
-      # Auto-discovery module (convenience wrapper)
+      # KDC database management from the per-realm principal bundle
+      kdc = import ./modules/kdc.nix;
+
+      # Deprecated compatibility shim for the old aegis.autoSecrets options
       autoSecrets = import ./modules/auto-secrets.nix;
 
-      # Default includes both
+      # Default: the core module plus the deprecated shim, so existing
+      # configurations keep evaluating while they migrate.
       default = {
         imports = [ ./modules/secrets.nix ./modules/auto-secrets.nix ];
       };
@@ -34,6 +38,7 @@
           test -f ${./modules/secrets.nix}
           test -f ${./modules/auto-secrets.nix}
           test -f ${./modules/home-secrets.nix}
+          test -f ${./modules/kdc.nix}
           echo "OK"
           touch $out
         '';
@@ -49,6 +54,10 @@
         # Service dependency on secrets
         service-dependency =
           import ./tests/service-dependency.nix { inherit pkgs; };
+
+        # Manifest-driven deployment: target paths, ownership, modes, the
+        # legacy base64 keytab wrapper, and sshd ordering
+        manifest = import ./tests/manifest.nix { inherit pkgs; };
       } else
         { }));
   };

@@ -118,7 +118,7 @@ Prefer `config.aegis.secrets.manifest.targets.<name>` over hardcoding a path.
 ### `aegis.kdc` (NixOS)
 
 Rebuilds a Heimdal KDC database from the per-realm principal bundle produced by
-`aegis build-keytabs` / `aegis realm export`.
+`aegis build keytabs` / `aegis realm export`.
 
 ```nix
 aegis.kdc = {
@@ -189,7 +189,7 @@ Where a secret lands is recorded in the manifest, which the aegis tools derive
 from `src/hosts/<host>.toml`. Change one with:
 
 ```bash
-aegis set-placement myhost keytab --target /etc/krb5.keytab --mode 0600
+aegis host set-placement myhost keytab --target /etc/krb5.keytab --mode 0600
 aegis reencrypt --host myhost
 ```
 

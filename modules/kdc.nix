@@ -3,7 +3,7 @@
 # Aegis KDC: rebuild a Heimdal KDC database from the principal bundle in
 # aegis-secrets.
 #
-# `aegis build-keytabs` / `aegis realm export` produce, per realm:
+# `aegis build keytabs` / `aegis realm export` produce, per realm:
 #
 #   deploy/kdc/<REALM>-principals.age   every principal, as decrypted dump lines
 #   deploy/kdc/<REALM>-realm-key.age    the realm master key
@@ -200,7 +200,7 @@ in {
           aegis.kdc.role is "${cfg.role}" but this host does not have that role.
 
           Roles come from secrets.toml; add the host with:
-            aegis add-host-to-role ${cfg.role} ${config.networking.hostName}
+            aegis role add-host ${cfg.role} ${config.networking.hostName}
           and rebuild. Without the role key the principal bundle cannot be
           decrypted.
         '';

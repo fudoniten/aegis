@@ -58,6 +58,10 @@
         # Manifest-driven deployment: target paths, ownership, modes, the
         # legacy base64 keytab wrapper, and sshd ordering
         manifest = import ./tests/manifest.nix { inherit pkgs; };
+
+        # Secrets encrypted to a role: one shared ciphertext, decrypted in
+        # phase 2 with the role key the host unwrapped in phase 1
+        role-secret = import ./tests/role-secret.nix { inherit pkgs; };
       } else
         { }));
   };

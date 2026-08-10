@@ -199,7 +199,7 @@ Defaults put most things under `/run/aegis/`:
 /run/aegis/
   keytab             # Kerberos keytab
   nexus-key          # Nexus DDNS key
-  secrets/<name>     # Custom secrets
+  secrets/<name>     # Custom secrets, host-encrypted or role-encrypted
   roles/
     kdc              # Role key (decrypted in phase 1, used in phase 2)
   users/
@@ -221,11 +221,41 @@ SSH host keys default to `/etc/ssh`, since that is where sshd expects them.
 - User deployment keys
 
 **Phase 2** (with keys from phase 1):
-- Role-specific secrets (using role key)
-- User secrets (using user deployment key)
+- Role secrets (using the role key)
+- User secrets (using the user deployment key)
 
 This allows the KDC to decrypt all host keytabs (using the kdc role key), while
 each host can only decrypt its own keytab (using its host master key).
+
+### Role secrets
+
+A manifest entry carrying a `role` field is a secret encrypted to that role
+rather than to this host. There is one copy of it, shared by every member,
+which is why the source points out of the host's own directory:
+
+```toml
+roles = ["authentik"]
+
+[secrets.ldap-bind-password]
+source = "../../roles/authentik/secrets/ldap-bind-password.age"
+target = "/run/authentik/ldap-password"
+user = "authentik"
+group = "authentik"
+mode = "0400"
+role = "authentik"
+```
+
+The module reads `role` and derives the rest: phase 2, decrypted with
+`/run/aegis/roles/<role>`, and ordered `After=`/`Requires=` that role's
+phase-1 unit specifically — `aegis-phase1.target` is reached by weak
+`wantedBy` dependencies and would activate even if the role key had failed.
+A host whose manifest names a role it does not hold fails evaluation with an
+assertion rather than producing a unit that can never succeed.
+
+Write these with `aegis secret import <name> --role <role>` (or
+`aegis secret new --role`). Grant them to another host with
+`aegis role add-host <role> <host>`: nothing is re-encrypted, so the secret
+follows the service between machines without the plaintext being needed again.
 
 ## Dry-run mode
 
@@ -242,10 +272,11 @@ Enable it deliberately for a migration, verify, then turn it off.
 nix flake check
 ```
 
-Runs module evaluation plus four NixOS VM tests: basic decryption, two-phase
-role keys, service dependency ordering, and manifest-driven deployment
-(target paths, ownership, modes, legacy base64 keytab unwrapping, sshd
-ordering).
+Runs module evaluation plus five NixOS VM tests: basic decryption, two-phase
+role keys, service dependency ordering, manifest-driven deployment (target
+paths, ownership, modes, legacy base64 keytab unwrapping, sshd ordering), and
+role secrets (one shared ciphertext, phase-2 decryption with the role key,
+and the ordering that makes it reliable).
 
 ## See Also
 

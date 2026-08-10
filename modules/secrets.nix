@@ -60,7 +60,23 @@ let
     encoding = entry.encoding or null;
     phase = 1;
     identity = cfg.masterKeyPath;
+    # Units this one must wait for, beyond its phase target.  The targets are
+    # reached by `wantedBy`, which is weak: it activates even when a member
+    # unit failed.  Anything that would silently produce a *wrong* result
+    # rather than no result names its dependency directly instead.
+    extraRequires = [ ];
   };
+
+  # A secret encrypted to a role rather than to this host.  There is one
+  # ciphertext, shared by every member of the role, so it cannot be decrypted
+  # with the host master key: it needs the role key, which phase 1 unwrapped
+  # to /run/aegis/roles/<role>.  That is the whole reason phase 2 exists.
+  roleSecretEntry = role: base:
+    base // {
+      phase = 2;
+      identity = "/run/aegis/roles/${role}";
+      extraRequires = [ "aegis-role-${role}.service" ];
+    };
 
   sshEntries = map (entry:
     let
@@ -98,12 +114,23 @@ let
   });
 
   extraEntries = mapAttrsToList (name: entry:
-    normaliseEntry {
-      name = "secret-${name}";
-      kind = "plain";
-      inherit entry;
-      defaultTarget = "/run/aegis/secrets/${name}";
-    }) (manifest.secrets or { });
+    let
+      base = normaliseEntry {
+        name = "secret-${name}";
+        kind = "plain";
+        inherit entry;
+        defaultTarget = "/run/aegis/secrets/${name}";
+      };
+    in if (entry.role or null) != null then
+      roleSecretEntry entry.role base
+    else
+      base) (manifest.secrets or { });
+
+  # Roles named by a role secret, for the assertion below.  A manifest entry
+  # pointing at a role this host does not hold is worth failing evaluation
+  # over: at runtime it is a decrypt unit that can never succeed.
+  roleSecretRoles = unique (filter (r: r != null)
+    (mapAttrsToList (_: entry: entry.role or null) (manifest.secrets or { })));
 
   manifestRoles = manifest.roles or [ ];
 
@@ -249,14 +276,14 @@ let
       }";
     wantedBy = [ "aegis-phase${toString entry.phase}.target" ];
     before = [ "aegis-phase${toString entry.phase}.target" ];
-    after = if entry.phase == 1 then
+    after = (if entry.phase == 1 then
       [ "local-fs.target" ]
     else
-      [ "aegis-phase1.target" ];
-    requires = if entry.phase == 1 then
+      [ "aegis-phase1.target" ]) ++ (entry.extraRequires or [ ]);
+    requires = (if entry.phase == 1 then
       [ "local-fs.target" ]
     else
-      [ "aegis-phase1.target" ];
+      [ "aegis-phase1.target" ]) ++ (entry.extraRequires or [ ]);
 
     restartIfChanged = true;
     # No ExecStop that removes the target: with restartIfChanged, a switch
@@ -499,6 +526,11 @@ in {
           ''${secretsRepoPath}/deploy/hosts/''${networking.hostName}
         Only set this directly if you have a non-standard layout, or are
         supplying secrets from somewhere other than an aegis-secrets repo.
+
+        Note that secrets encrypted to a role are shared, so the manifest
+        names them relative to this directory and climbing out of it
+        (../../roles/<role>/secrets/<name>.age). Pointing this somewhere
+        detached from the rest of the repo leaves those unresolvable.
       '';
       default = null;
       defaultText = literalExpression
@@ -659,7 +691,19 @@ in {
           so there are no user deployment keys to decrypt.
         '';
       }
-    ];
+    ] ++ map (role: {
+      assertion = elem role cfg.roles;
+      message = ''
+        ${hostname} has a secret encrypted to role "${role}", but does not
+        hold that role's key, so nothing here can decrypt it.
+
+        Either the host was removed from the role and its manifest is stale,
+        or the role key was never built. In your aegis-secrets repo:
+
+          aegis role add-host ${role} ${hostname}
+          aegis build role-keys
+      '';
+    }) roleSecretRoles;
 
     warnings = optionals cfg.dryRun [''
       ╔═══════════════════════════════════════════════════════════════════╗

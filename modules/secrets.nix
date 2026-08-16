@@ -179,6 +179,95 @@ let
   allEntries = sshEntries ++ keytabEntries ++ nexusEntries ++ extraEntries
     ++ roleEntries ++ userKeyEntries ++ manualEntries;
 
+  # -------------------------------------------------------------------------
+  # Ownership validation
+  #
+  # Every decrypt unit ends in `chown <user>:<group>`.  An owner that does not
+  # exist on the host fails that chown -- at boot, and only *after* the
+  # plaintext has been written, so the secret sits on disk owned by root while
+  # the service that wanted it never starts.  The manifest that named the
+  # missing owner was known to be wrong at evaluation time, so that is where it
+  # is caught.
+  #
+  # Aegis validates but does not create.  A service user belongs to the module
+  # that runs the service: only that module knows the uid, home, shell and
+  # supplementary groups it needs, and a stub account minted here would collide
+  # with the real one the day the service is enabled -- turning a loud failure
+  # into a silently mis-owned secret.  Aegis creates exactly one account, the
+  # aegis-secrets group, because that one is genuinely its own.
+  #
+  # In practice a missing owner means one of three things: the service that
+  # owns the secret is not enabled on this host (the usual case -- a service
+  # user appears only with its module), the manifest names the wrong user, or
+  # the account is real but created outside the NixOS user database, which is
+  # what unmanagedUsers/unmanagedGroups are for.
+  #
+  # In dry-run this is a warning rather than an assertion.  Dry-run does not
+  # chown at all -- it prints the ownership it would have applied -- so there is
+  # nothing to fail yet, and a host mid-migration must stay buildable.  The
+  # warning is the point: it says what will break on the deploy that flips
+  # dryRun off, while there is still time to fix it.
+  # -------------------------------------------------------------------------
+
+  # `users.users.<key>.name` defaults to the attribute name but can be set
+  # independently, and it is the name chown will see, so both are accepted.
+  declaredUsers = unique
+    (attrNames config.users.users ++ mapAttrsToList (_: u: u.name) config.users.users);
+  declaredGroups = unique
+    (attrNames config.users.groups ++ mapAttrsToList (_: g: g.name) config.users.groups);
+
+  # chown takes a numeric id just as happily as a name, and a manifest is free
+  # to use one.  Nothing here can check whether the id is allocated.
+  isNumericId = name: builtins.match "[0-9]+" name != null;
+
+  knownUser = name:
+    isNumericId name || elem name declaredUsers || elem name cfg.unmanagedUsers;
+  knownGroup = name:
+    isNumericId name || elem name declaredGroups || elem name cfg.unmanagedGroups;
+
+  # One message per distinct owner, not per secret: a manifest that names the
+  # same missing user in five places is one mistake, and listing the affected
+  # secrets underneath says more than five copies of the same message.
+  secretsOwnedBy = field: owner:
+    map (entry: "${entry.name} -> ${entry.target}")
+    (filter (entry: entry.${field} == owner) allEntries);
+
+  missingUsers =
+    filter (user: !knownUser user) (unique (map (entry: entry.user) allEntries));
+  missingGroups = filter (group: !knownGroup group)
+    (unique (map (entry: entry.group) allEntries));
+
+  missingUserMessage = user: ''
+    Aegis on ${hostname} deploys secrets owned by user "${user}", but no such
+    user is declared on this host. The decrypt unit writes the plaintext and
+    then fails at `chown ${user}`, leaving the secret in place owned by root:
+
+      ${concatStringsSep "\n      " (secretsOwnedBy "user" user)}
+
+    Aegis does not create service users -- the module that runs the service
+    does. Fix this by one of:
+
+      - enabling the service that owns the secret, so it declares the user
+      - correcting `user =` for these entries in the host's secrets.toml
+      - listing "${user}" in aegis.secrets.unmanagedUsers, if the account is
+        real but created outside users.users
+  '';
+
+  missingGroupMessage = group: ''
+    Aegis on ${hostname} deploys secrets owned by group "${group}", but no such
+    group is declared on this host. The decrypt unit writes the plaintext and
+    then fails at `chown :${group}`, leaving the secret in place owned by root:
+
+      ${concatStringsSep "\n      " (secretsOwnedBy "group" group)}
+
+    Fix this by enabling the service that declares the group, correcting
+    `group =` in the host's secrets.toml, or listing "${group}" in
+    aegis.secrets.unmanagedGroups if it is created outside users.groups.
+  '';
+
+  ownershipProblems = map missingUserMessage missingUsers
+    ++ map missingGroupMessage missingGroups;
+
   # Unit names of the SSH host key decrypt services, for sshd to depend on
   # directly rather than via the phase target.
   sshUnitNames = map (entry: "aegis-${entry.name}.service") sshEntries;
@@ -591,6 +680,34 @@ in {
       default = [ ];
     };
 
+    unmanagedUsers = mkOption {
+      type = types.listOf types.str;
+      description = ''
+        Users that own secrets but are not declared in `users.users`.
+
+        Aegis fails evaluation when a secret is owned by a user the host does
+        not declare, because the decrypt unit would write the plaintext and
+        then fail at `chown`. List an account here only if it genuinely exists
+        outside the NixOS user database -- created by hand on a host with
+        `users.mutableUsers`, or by something Nix cannot see.
+
+        This is an escape hatch, not a fix: the usual cause of the assertion is
+        that the service owning the secret is not enabled on this host, and
+        adding its user here just moves the failure to boot.
+      '';
+      default = [ ];
+      example = [ "legacy-app" ];
+    };
+
+    unmanagedGroups = mkOption {
+      type = types.listOf types.str;
+      description = ''
+        Groups that own secrets but are not declared in `users.groups`.
+        The counterpart to unmanagedUsers, on the same terms.
+      '';
+      default = [ ];
+    };
+
     manageSshd = mkOption {
       type = types.bool;
       default = true;
@@ -691,7 +808,10 @@ in {
           so there are no user deployment keys to decrypt.
         '';
       }
-    ] ++ map (role: {
+    ] ++ optionals (!cfg.dryRun) (map (problem: {
+      assertion = false;
+      message = problem;
+    }) ownershipProblems) ++ map (role: {
       assertion = elem role cfg.roles;
       message = ''
         ${hostname} has a secret encrypted to role "${role}", but does not
@@ -718,7 +838,13 @@ in {
       ║  To deploy secrets for real, set:                                 ║
       ║    aegis.secrets.dryRun = false;                                  ║
       ╚═══════════════════════════════════════════════════════════════════╝
-    ''] ++ optionals (!manifestExists && cfg.secrets != { }) [''
+    ''] ++ optionals cfg.dryRun (map (problem: ''
+      Aegis [${hostname}]: this will fail when dryRun is turned off.
+      Dry-run logs ownership instead of applying it, so the chown below has not
+      run yet.
+
+      ${problem}'') ownershipProblems)
+    ++ optionals (!manifestExists && cfg.secrets != { }) [''
       Aegis [${hostname}]: no manifest found; using only the ${
         toString (length (attrNames cfg.secrets))
       } secret(s) declared in Nix.

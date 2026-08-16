@@ -102,6 +102,8 @@ Core module. Reads the manifest and generates a decryption unit per secret.
 | `secrets` | attrsOf secret | {} | Extra secrets declared in Nix |
 | `roles` | list of string | from manifest | Roles this host has |
 | `users` | list of string | [] | Users whose secrets to decrypt |
+| `unmanagedUsers` | list of string | [] | Owners that exist outside `users.users` (escape hatch) |
+| `unmanagedGroups` | list of string | [] | Owners that exist outside `users.groups` (escape hatch) |
 | `manageSshd` | bool | true | Make sshd require the units that decrypt its host keys |
 | `dryRun` | bool | **false** | Decrypt to `dryRunPath` instead of real targets |
 | `verbose` | bool | false | List configured secrets at evaluation time |
@@ -257,6 +259,39 @@ Write these with `aegis secret import <name> --role <role>` (or
 `aegis role add-host <role> <host>`: nothing is re-encrypted, so the secret
 follows the service between machines without the plaintext being needed again.
 
+## Ownership
+
+Every decrypt unit ends in `chown <user>:<group>`. If the owner does not exist
+on the host, that chown fails — at boot, and only after the plaintext has been
+written, so the secret ends up on disk owned by root while the service that
+wanted it never starts:
+
+```
+Decrypting secret-nebula-fudo-key -> /run/aegis/nebula/fudo.key
+chown: invalid user: 'nebula-fudo:nebula-fudo'
+```
+
+Aegis catches this at evaluation time instead: an owner that is in no
+`users.users` / `users.groups` (and is not a numeric id) fails the build,
+naming the secrets involved. Under `dryRun` it is a warning, since dry-run logs
+ownership rather than applying it — the warning tells you what will break on
+the deploy that turns dry-run off.
+
+Aegis does **not** create the account. A service user belongs to the module
+that runs the service, which is the only thing that knows what uid, home, shell
+and supplementary groups it needs; a stub user created here would collide with
+the real one the day that module is enabled, turning a loud failure into a
+silently mis-owned secret. Aegis creates one group of its own, `aegis-secrets`,
+and nothing else.
+
+Almost always the fix is to enable the service that owns the secret — a service
+user appears only with its module, so a manifest naming `nebula-fudo` on a host
+where Nebula is not enabled is the manifest and the host disagreeing about what
+the host runs. Failing that, correct `user =` in the manifest. Only if the
+account genuinely lives outside the NixOS user database does it belong in
+`unmanagedUsers` / `unmanagedGroups`, which suppress the check and hand the
+failure back to boot.
+
 ## Dry-run mode
 
 `dryRun = true` relocates every target under `dryRunPath`, preserving directory
@@ -277,6 +312,9 @@ role keys, service dependency ordering, manifest-driven deployment (target
 paths, ownership, modes, legacy base64 keytab unwrapping, sshd ordering), and
 role secrets (one shared ciphertext, phase-2 decryption with the role key,
 and the ordering that makes it reliable).
+
+`tests/ownership.nix` is evaluation-only rather than a VM test: what it checks
+is that a configuration *fails to evaluate*, which no VM can observe.
 
 ## See Also
 

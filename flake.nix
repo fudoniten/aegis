@@ -62,6 +62,11 @@
         # Secrets encrypted to a role: one shared ciphertext, decrypted in
         # phase 2 with the role key the host unwrapped in phase 1
         role-secret = import ./tests/role-secret.nix { inherit pkgs; };
+
+        # A secret owned by a user or group the host does not declare fails
+        # evaluation instead of failing chown at boot. Evaluation-only.
+        ownership =
+          import ./tests/ownership.nix { inherit pkgs nixpkgs system; };
       } else
         { }));
   };

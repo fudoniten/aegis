@@ -242,7 +242,7 @@ let
     user is declared on this host. The decrypt unit writes the plaintext and
     then fails at `chown ${user}`, leaving the secret in place owned by root:
 
-      ${concatStringsSep "\n      " (secretsOwnedBy "user" user)}
+      ${concatStringsSep "\n  " (secretsOwnedBy "user" user)}
 
     Aegis does not create service users -- the module that runs the service
     does. Fix this by one of:
@@ -258,7 +258,7 @@ let
     group is declared on this host. The decrypt unit writes the plaintext and
     then fails at `chown :${group}`, leaving the secret in place owned by root:
 
-      ${concatStringsSep "\n      " (secretsOwnedBy "group" group)}
+      ${concatStringsSep "\n  " (secretsOwnedBy "group" group)}
 
     Fix this by enabling the service that declares the group, correcting
     `group =` in the host's secrets.toml, or listing "${group}" in

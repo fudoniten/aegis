@@ -546,8 +546,19 @@ let
 
       service = mkOption {
         type = types.str;
-        description = "Name of the systemd service for this secret.";
-        default = "aegis-secret-${name}";
+        description = ''
+          Name of the systemd unit that decrypts this secret.
+
+          Consumers order themselves after it -- and `requires` it, so a
+          failed decrypt stops the service rather than starting it against a
+          secret that is not there.
+        '';
+        # `aegis-<name>`, matching how every unit is named from `allEntries`.
+        # This read `aegis-secret-<name>`, which is the name of a *manifest*
+        # `[secrets."<name>"]` entry, not of one declared here: anything that
+        # trusted it ordered itself after a unit that does not exist, which
+        # systemd accepts in silence.
+        default = "aegis-${name}";
         readOnly = true;
       };
     };

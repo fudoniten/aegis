@@ -67,6 +67,12 @@
         # evaluation instead of failing chown at boot. Evaluation-only.
         ownership =
           import ./tests/ownership.nix { inherit pkgs nixpkgs system; };
+
+        # An [[ssh-host-keys]] entry that cannot be an sshd identity -- a type
+        # ssh-keygen does not have, or a type shared with another entry --
+        # fails evaluation instead of reaching sshd. Evaluation-only.
+        ssh-host-keys =
+          import ./tests/ssh-host-keys.nix { inherit pkgs nixpkgs system; };
       } else
         { }));
   };

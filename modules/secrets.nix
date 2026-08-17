@@ -268,6 +268,99 @@ let
   ownershipProblems = map missingUserMessage missingUsers
     ++ map missingGroupMessage missingGroups;
 
+  # -------------------------------------------------------------------------
+  # SSH host key validation
+  #
+  # `[[ssh-host-keys]]` means, specifically, the keys sshd presents as this
+  # host's identity. It is not a list of "SSH keys this host holds": a deploy
+  # key and an initrd key are both SSH keypairs and neither is an sshd host
+  # key. Consumers cannot tell the difference -- the NixOS configuration in
+  # front of this module builds services.openssh.hostKeys from every entry
+  # carrying a `type` -- so anything else in the list becomes an identity sshd
+  # offers, and its private half turns into a host key in everything but name.
+  #
+  # Both failure modes are quiet at build time and awkward at boot, which is
+  # why they are caught here instead:
+  #
+  #   - A `type` ssh-keygen does not have (`deploy_ed25519`, `initrd_ed25519`)
+  #     makes any sshd-keygen fallback run `ssh-keygen -t deploy_ed25519` and
+  #     fail the unit, on a path that only runs when a key is already missing.
+  #
+  #   - A `type` repeated across entries collapses them: units are named
+  #     `aegis-ssh-<type>` and collected with `listToAttrs`, so the last entry
+  #     of a type wins and the others' targets are never written. sshd is then
+  #     pointed at paths nothing populates, and on a tmpfs target a fallback
+  #     mints a fresh identity on every boot.
+  #
+  # Keys that are not sshd identities belong in `[secrets]`, which deploys
+  # them without handing them to sshd.
+  # -------------------------------------------------------------------------
+
+  # What `ssh-keygen -t` accepts, which is also what sshd will load as a host
+  # key. A type outside this set cannot be an sshd identity, whatever else it
+  # may legitimately be.
+  sshdKeyTypes = [ "dsa" "ecdsa" "ecdsa-sk" "ed25519" "ed25519-sk" "rsa" ];
+
+  # Untyped entries are left alone: consumers filter them out rather than
+  # handing them to sshd, so they are merely unused, not wrong.
+  typedSshEntries = filter (entry: entry.keyType != null) sshEntries;
+
+  unknownTypeEntries =
+    filter (entry: !elem entry.keyType sshdKeyTypes) typedSshEntries;
+
+  duplicateSshTypes = let types = map (entry: entry.keyType) typedSshEntries;
+  in unique (filter (type: count (other: other == type) types > 1) types);
+
+  sshEntriesOfType = type:
+    map (entry: entry.target)
+    (filter (entry: entry.keyType == type) typedSshEntries);
+
+  unknownTypeMessage = ''
+    Aegis on ${hostname} declares SSH host keys whose `type` is not an SSH key
+    type, so sshd cannot use them and `ssh-keygen -t` cannot generate them:
+
+      ${
+        concatMapStringsSep "\n      "
+        (entry: "${entry.keyType} -> ${entry.target}") unknownTypeEntries
+      }
+
+    `[[ssh-host-keys]]` is the list of identities sshd presents. A deploy or
+    initrd key is not one of those, and putting it here both hands its private
+    half to sshd and breaks the fallback that regenerates a missing host key.
+
+    Move these to `[secrets]` in the host's secrets.toml -- they are deployed
+    the same way, just not offered to sshd -- and leave `[[ssh-host-keys]]`
+    holding only ${concatStringsSep ", " sshdKeyTypes}.
+  '';
+
+  duplicateTypeMessage = ''
+    Aegis on ${hostname} declares more than one SSH host key of the same type:
+
+      ${
+        concatMapStringsSep "\n      " (type: ''
+          ${type}:
+            ${concatStringsSep "\n            " (sshEntriesOfType type)}'')
+        duplicateSshTypes
+      }
+
+    Decrypt units are named `aegis-ssh-<type>` and collected with listToAttrs,
+    so entries sharing a type collapse into one unit: the last one wins and the
+    others are never written. sshd is then configured to read paths nothing
+    populates.
+
+    Give each entry the type it actually is, and move any key that is not an
+    sshd identity -- a deploy or initrd key -- to `[secrets]`.
+  '';
+
+  sshKeyProblems = optional (unknownTypeEntries != [ ]) unknownTypeMessage
+    ++ optional (duplicateSshTypes != [ ]) duplicateTypeMessage;
+
+  # Everything that makes this host's secrets wrong rather than merely absent.
+  # Fatal when Aegis is placing secrets for real; a warning in dry-run, where
+  # nothing has been written to production yet and a host mid-migration has to
+  # stay buildable.
+  deployProblems = ownershipProblems ++ sshKeyProblems;
+
   # Unit names of the SSH host key decrypt services, for sshd to depend on
   # directly rather than via the phase target.
   sshUnitNames = map (entry: "aegis-${entry.name}.service") sshEntries;
@@ -822,7 +915,7 @@ in {
     ] ++ optionals (!cfg.dryRun) (map (problem: {
       assertion = false;
       message = problem;
-    }) ownershipProblems) ++ map (role: {
+    }) deployProblems) ++ map (role: {
       assertion = elem role cfg.roles;
       message = ''
         ${hostname} has a secret encrypted to role "${role}", but does not
@@ -855,6 +948,14 @@ in {
       run yet.
 
       ${problem}'') ownershipProblems)
+    # The SSH problems are not deferred by dry-run the way ownership is -- the
+    # manifest is already wrong, and dry-run only moves where the wrong thing
+    # lands. Warned rather than asserted here for the same reason as ownership:
+    # a host mid-migration has to stay buildable.
+    ++ optionals cfg.dryRun (map (problem: ''
+      Aegis [${hostname}]: this will fail when dryRun is turned off.
+
+      ${problem}'') sshKeyProblems)
     ++ optionals (!manifestExists && cfg.secrets != { }) [''
       Aegis [${hostname}]: no manifest found; using only the ${
         toString (length (attrNames cfg.secrets))

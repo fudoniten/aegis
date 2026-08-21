@@ -34,6 +34,14 @@ let
   else
     "${cfg.kdcSecretsPath}/${cfg.realm}-realm-key.age";
 
+  # `aegis build keytabs` writes one of these per realm for each entry in
+  # `_KDC_SERVICE_KEYTABS` it found a principal for -- kadmind and kpasswdd
+  # always, hprop only for a realm doing replication. Distinct from the host
+  # keytabs `aegis.secrets` places: these authenticate the KDC's own daemons,
+  # not a realm member, so they are decrypted here with the role key rather
+  # than a host key.
+  serviceKeytabSource = name: "${cfg.kdcSecretsPath}/${cfg.realm}-${name}.keytab.age";
+
   mergeScript = pkgs.writeShellScript "aegis-kdc-merge-${cfg.realm}" ''
     set -euo pipefail
 
@@ -66,6 +74,17 @@ let
       "${principalsSource}"
 
     install -m 0600 -o ${cfg.user} -g ${cfg.group} "$WORK/realm.key" "$REALM_KEY"
+
+    ${concatStringsSep "\n" (mapAttrsToList (name: target: ''
+      echo "Decrypting ${name} service keytab..."
+      install -d -m 0700 -o ${cfg.user} -g ${cfg.group} "$(dirname ${target})"
+      ${pkgs.age}/bin/age --decrypt \
+        --identity "$ROLE_KEY" \
+        --output "${target}" \
+        "${serviceKeytabSource name}"
+      chown ${cfg.user}:${cfg.group} "${target}"
+      chmod 0600 "${target}"
+    '') cfg.serviceKeytabs)}
 
     echo "Merging principals into $DB..."
     # kdc-merge-principals.rb keeps any principal that exists in the live
@@ -185,6 +204,29 @@ in {
         Services to restart after the database is rebuilt, e.g. [ "kdc" ].
       '';
       example = [ "kdc" "kadmind" ];
+    };
+
+    serviceKeytabs = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      description = ''
+        Map of KDC service keytab name (as `aegis build keytabs` names them --
+        "kadmind", "kpasswdd", "hprop") to the path this host should decrypt
+        it to. Each name must have a corresponding
+        `deploy/kdc/<REALM>-<name>.keytab.age` in the secrets repo, or the
+        merge script fails outright rather than silently starting a KDC whose
+        admin/password daemons cannot authenticate.
+
+        These are separate from the per-host keytabs `aegis.secrets` places:
+        they authenticate the KDC's own daemons, encrypted to the KDC role
+        rather than any one host's key.
+      '';
+      example = literalExpression ''
+        {
+          kadmind = "/var/lib/heimdal/kadmind.keytab";
+          kpasswdd = "/var/lib/heimdal/kpasswdd.keytab";
+        }
+      '';
     };
   };
 

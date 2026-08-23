@@ -45,6 +45,20 @@ let
   mergeScript = pkgs.writeShellScript "aegis-kdc-merge-${cfg.realm}" ''
     set -euo pipefail
 
+    # kdc-merge-principals.rb shells out to bare `kadmin`, both to dump the
+    # existing database and to build the new one, and heimdal is not on a
+    # systemd unit's default PATH. What *is* there is the `kadmin.local`
+    # wrapper fudo-nix-lib puts in systemPackages -- a different name, so the
+    # script fails with "No such file or directory - kadmin (Errno::ENOENT)"
+    # after having done all of its work.
+    #
+    # Exported here rather than declared as the unit's `path` so that running
+    # this script by hand -- which is how anyone debugging a KDC rollout will
+    # meet it -- behaves the same as running it under systemd. coreutils comes
+    # along because setting a unit `path` would otherwise replace the default
+    # PATH that install/mktemp/dirname are currently found on.
+    export PATH="${makeBinPath [ pkgs.heimdal pkgs.coreutils ]}:$PATH"
+
     ROLE_KEY="${roleKeyPath}"
     STATE_DIR="${cfg.stateDir}"
     DB="${cfg.databasePath}"

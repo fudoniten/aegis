@@ -45,6 +45,20 @@ let
   mergeScript = pkgs.writeShellScript "aegis-kdc-merge-${cfg.realm}" ''
     set -euo pipefail
 
+    # kdc-merge-principals.rb shells out to bare `kadmin`, both to dump the
+    # existing database and to build the new one, and heimdal is not on a
+    # systemd unit's default PATH. What *is* there is the `kadmin.local`
+    # wrapper fudo-nix-lib puts in systemPackages -- a different name, so the
+    # script fails with "No such file or directory - kadmin (Errno::ENOENT)"
+    # after having done all of its work.
+    #
+    # Exported here rather than declared as the unit's `path` so that running
+    # this script by hand -- which is how anyone debugging a KDC rollout will
+    # meet it -- behaves the same as running it under systemd. coreutils comes
+    # along because setting a unit `path` would otherwise replace the default
+    # PATH that install/mktemp/dirname are currently found on.
+    export PATH="${makeBinPath [ pkgs.heimdal pkgs.coreutils ]}:$PATH"
+
     ROLE_KEY="${roleKeyPath}"
     STATE_DIR="${cfg.stateDir}"
     DB="${cfg.databasePath}"
@@ -85,6 +99,27 @@ let
       chown ${cfg.user}:${cfg.group} "${target}"
       chmod 0600 "${target}"
     '') cfg.serviceKeytabs)}
+
+    # fudo-nix-lib's KDC module pre-creates the database with a systemd-tmpfiles
+    # rule of type `f`, so on a KDC's first boot $DB is a zero-byte file rather
+    # than absent. kdc-merge-principals.rb decides whether to dump an
+    # existing database on `File::exist?` alone, so that placeholder sends it
+    # down the "merge into existing" path, where kadmin fails with
+    #
+    #   Failed to prepare stmt SELECT number FROM Version: no such table: Version
+    #
+    # and takes this unit -- and so the whole KDC rollout -- with it, on exactly
+    # the boot where there is nothing to preserve.
+    #
+    # Only a zero-length file is removed. The merge script builds the new
+    # database in a temporary directory and moves it into place either way; the
+    # existing one is read solely to carry forward principals created locally
+    # with kadmin. A non-empty database that cannot be dumped is a real failure
+    # and must stay loud rather than be silently discarded.
+    if [ -e "$DB" ] && [ ! -s "$DB" ]; then
+      echo "Removing empty database placeholder: $DB"
+      rm -f "$DB"
+    fi
 
     echo "Merging principals into $DB..."
     # kdc-merge-principals.rb keeps any principal that exists in the live

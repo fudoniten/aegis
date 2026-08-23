@@ -86,6 +86,27 @@ let
       chmod 0600 "${target}"
     '') cfg.serviceKeytabs)}
 
+    # fudo-nix-lib's KDC module pre-creates the database with a systemd-tmpfiles
+    # rule of type `f`, so on a KDC's first boot $DB is a zero-byte file rather
+    # than absent. kdc-merge-principals.rb decides whether to dump an
+    # existing database on `File::exist?` alone, so that placeholder sends it
+    # down the "merge into existing" path, where kadmin fails with
+    #
+    #   Failed to prepare stmt SELECT number FROM Version: no such table: Version
+    #
+    # and takes this unit -- and so the whole KDC rollout -- with it, on exactly
+    # the boot where there is nothing to preserve.
+    #
+    # Only a zero-length file is removed. The merge script builds the new
+    # database in a temporary directory and moves it into place either way; the
+    # existing one is read solely to carry forward principals created locally
+    # with kadmin. A non-empty database that cannot be dumped is a real failure
+    # and must stay loud rather than be silently discarded.
+    if [ -e "$DB" ] && [ ! -s "$DB" ]; then
+      echo "Removing empty database placeholder: $DB"
+      rm -f "$DB"
+    fi
+
     echo "Merging principals into $DB..."
     # kdc-merge-principals.rb keeps any principal that exists in the live
     # database but not in the incoming bundle, so locally-created user

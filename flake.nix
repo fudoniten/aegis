@@ -63,6 +63,10 @@
         # phase 2 with the role key the host unwrapped in phase 1
         role-secret = import ./tests/role-secret.nix { inherit pkgs; };
 
+        # Named keytabs: an arbitrary principal list rather than the host's
+        # own, delivered either to the host or through a role
+        named-keytab = import ./tests/named-keytab.nix { inherit pkgs; };
+
         # A secret owned by a user or group the host does not declare fails
         # evaluation instead of failing chown at boot. Evaluation-only.
         ownership =

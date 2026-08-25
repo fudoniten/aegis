@@ -117,6 +117,39 @@ Read-only outputs, for referring to secrets elsewhere in your config:
 
 Prefer `config.aegis.secrets.manifest.targets.<name>` over hardcoding a path.
 
+### Named keytabs
+
+`[keytab]` is the host's own: its service principals, from
+`src/hosts/<host>.toml`. A manifest may also carry a `[keytabs]` table of
+*named* keytabs — an arbitrary principal list each, written by
+`aegis keytab` in aegis-tools-system:
+
+```toml
+[keytabs.hermes]
+source = "../../roles/hermes/keytabs/hermes.age"
+target = "/run/hermes/krb5.keytab"
+user = "hermes"
+group = "hermes"
+mode = "0400"
+role = "hermes"
+```
+
+They deploy on exactly the same terms as `[secrets]`: an entry without `role`
+is decrypted in phase 1 with the host master key, and one with `role` is
+decrypted in phase 2 with that role's key, ordered `Requires=` that role's
+phase-1 unit. A host whose manifest names a role it does not hold fails
+evaluation, as it does for role secrets.
+
+Refer to one by name rather than by path:
+
+```nix
+systemd.services.hermes.environment.KRB5_KTNAME =
+  config.aegis.secrets.manifest.targets.keytab-hermes;
+```
+
+The unit is `aegis-keytab-<name>.service`, and the `targets` key is
+`keytab-<name>` — the host's own keytab stays `keytab`.
+
 ### `aegis.kdc` (NixOS)
 
 Rebuilds a Heimdal KDC database from the per-realm principal bundle produced by
@@ -199,7 +232,8 @@ Defaults put most things under `/run/aegis/`:
 
 ```
 /run/aegis/
-  keytab             # Kerberos keytab
+  keytab             # Kerberos keytab (this host's own service principals)
+  keytabs/<name>     # Named keytabs, host-encrypted or role-encrypted
   nexus-key          # Nexus DDNS key
   secrets/<name>     # Custom secrets, host-encrypted or role-encrypted
   roles/
@@ -307,11 +341,13 @@ Enable it deliberately for a migration, verify, then turn it off.
 nix flake check
 ```
 
-Runs module evaluation plus five NixOS VM tests: basic decryption, two-phase
+Runs module evaluation plus six NixOS VM tests: basic decryption, two-phase
 role keys, service dependency ordering, manifest-driven deployment (target
-paths, ownership, modes, legacy base64 keytab unwrapping, sshd ordering), and
+paths, ownership, modes, legacy base64 keytab unwrapping, sshd ordering),
 role secrets (one shared ciphertext, phase-2 decryption with the role key,
-and the ordering that makes it reliable).
+and the ordering that makes it reliable), and named keytabs (host-delivered
+in phase 1 and role-delivered in phase 2, coexisting with the host's own
+keytab).
 
 `tests/ownership.nix` is evaluation-only rather than a VM test: what it checks
 is that a configuration *fails to evaluate*, which no VM can observe.

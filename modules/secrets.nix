@@ -106,6 +106,25 @@ let
     defaultMode = "0600";
   });
 
+  # Named keytabs: an explicit principal list rather than this host's own
+  # service principals, so unlike [keytab] there can be several, they need not
+  # name this host at all, and one may arrive through a role rather than
+  # directly.  Otherwise they deploy on exactly the same terms as any other
+  # secret, which is the point -- ownership, mode and phase behave the same.
+  namedKeytabEntries = mapAttrsToList (name: entry:
+    let
+      base = normaliseEntry {
+        name = "keytab-${name}";
+        kind = "plain";
+        inherit entry;
+        defaultTarget = "/run/aegis/keytabs/${name}";
+        defaultMode = "0600";
+      };
+    in if (entry.role or null) != null then
+      roleSecretEntry entry.role base
+    else
+      base) (manifest.keytabs or { });
+
   nexusEntries = optional (manifest ? nexus-key) (normaliseEntry {
     name = "nexus-key";
     kind = "plain";
@@ -130,7 +149,9 @@ let
   # pointing at a role this host does not hold is worth failing evaluation
   # over: at runtime it is a decrypt unit that can never succeed.
   roleSecretRoles = unique (filter (r: r != null)
-    (mapAttrsToList (_: entry: entry.role or null) (manifest.secrets or { })));
+    ((mapAttrsToList (_: entry: entry.role or null) (manifest.secrets or { }))
+      ++ (mapAttrsToList (_: entry: entry.role or null)
+        (manifest.keytabs or { }))));
 
   manifestRoles = manifest.roles or [ ];
 
@@ -176,8 +197,8 @@ let
     identity = secretCfg.identity;
   }) cfg.secrets;
 
-  allEntries = sshEntries ++ keytabEntries ++ nexusEntries ++ extraEntries
-    ++ roleEntries ++ userKeyEntries ++ manualEntries;
+  allEntries = sshEntries ++ keytabEntries ++ namedKeytabEntries ++ nexusEntries
+    ++ extraEntries ++ roleEntries ++ userKeyEntries ++ manualEntries;
 
   # -------------------------------------------------------------------------
   # Ownership validation

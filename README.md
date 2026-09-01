@@ -113,6 +113,10 @@ Read-only outputs, for referring to secrets elsewhere in your config:
 - `aegis.secrets.manifest.loaded` — whether a manifest was found
 - `aegis.secrets.manifest.targets` — attrset of secret name to decrypted path
 - `aegis.secrets.manifest.sshHostKeys` — resolved SSH key paths and types
+- `aegis.secrets.manifest.nexusKeyFormat` — `"hmac"`, `"ed25519"`, or `null` if
+  this host has no `[nexus-key]` entry; only the private key is represented
+  here, since the Ed25519 public key is not a secret and is not part of the
+  manifest at all
 - `aegis.secrets.manifest.roles` — roles declared for this host
 
 Prefer `config.aegis.secrets.manifest.targets.<name>` over hardcoding a path.

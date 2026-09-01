@@ -106,11 +106,18 @@ let
     defaultMode = "0600";
   });
 
-  nexusEntries = optional (manifest ? nexus-key) (normaliseEntry {
+  nexusEntries = optional (manifest ? nexus-key) ((normaliseEntry {
     name = "nexus-key";
     kind = "plain";
     entry = manifest.nexus-key;
     defaultTarget = "/run/aegis/nexus-key";
+  }) // {
+    # "hmac" (legacy, shared-secret) or "ed25519" (Nexus /api/v3, pubkey).
+    # Carried through the manifest's generic `type` field -- the same one
+    # SSH host key entries use for their key type -- and defaulted here
+    # because manifests written before the ed25519 format existed have no
+    # `type` on this entry at all.
+    format = manifest.nexus-key.type or "hmac";
   });
 
   extraEntries = mapAttrsToList (name: entry:
@@ -875,6 +882,24 @@ in {
         '';
         default = listToAttrs
           (map (entry: nameValuePair entry.name entry.target) allEntries);
+        readOnly = true;
+      };
+
+      nexusKeyFormat = mkOption {
+        type = types.nullOr (types.enum [ "hmac" "ed25519" ]);
+        description = ''
+          Format of this host's Nexus DDNS key, if the manifest declares one:
+          "hmac" authenticates against Nexus's legacy /api/v2 (a shared
+          secret set with `nexus.client.hmac-key-file`), "ed25519" against
+          /api/v3 (a private key set with `nexus.client.private-key-file`).
+          null if the manifest has no [nexus-key] entry at all.
+
+          Only the private key is ever exposed here -- the corresponding
+          Ed25519 public key is not a secret, is not part of this manifest,
+          and is instead read directly (in cleartext) from the aegis-secrets
+          checkout by whatever builds the Nexus server's host-public-keys.
+        '';
+        default = if nexusEntries != [ ] then (head nexusEntries).format else null;
         readOnly = true;
       };
 

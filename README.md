@@ -308,10 +308,14 @@ A role key that phase 1 has not unwrapped yet is reported as skipped rather
 than failed — on a first deploy it does not exist at all, and blocking the
 deploy that would create it helps nobody.
 
-The units the activation should restart, in phase order, are listed in
-`/etc/aegis/profile-units`. Generated from the same entry list, so the deploy
-repo does not have to reconstruct it from the manifest and get it subtly
-wrong.
+The units the activation should restart are listed in
+`/etc/aegis/profile-units`, in the order to restart them: by phase, and
+within each phase with the SSH host-key units last. sshd `Requires=` those,
+so a failure there is the one that stops sshd and strands the deploy —
+putting them last means anything else that was going to fail has already
+failed, with sshd still up to carry the rollback. Generated from the same
+entry list, so the deploy repo does not have to reconstruct it from the
+manifest and get it subtly wrong.
 
 ### What this does not solve
 

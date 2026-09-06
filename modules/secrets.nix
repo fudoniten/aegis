@@ -1278,9 +1278,16 @@ in {
       # read by the activation script so the deploy repo does not have to
       # reconstruct it from the manifest and get it subtly wrong.
       "aegis/profile-units".text = let
+        # SSH host-key units go last within their phase. sshd `Requires=`
+        # them, so a failure there is the one that stops sshd and strands the
+        # deploy -- and anything else that was going to fail has then already
+        # failed, with sshd still up to carry the rollback.
+        isSshEntry = entry: entry.kind == "ssh-host-key";
+        unitName = entry: "aegis-${entry.name}.service";
         unitsInPhase = phase:
-          map (entry: "aegis-${entry.name}.service")
-          (filter (entry: entry.phase == phase) verifiableEntries);
+          let inPhase = filter (entry: entry.phase == phase) verifiableEntries;
+          in map unitName (filter (entry: !isSshEntry entry) inPhase)
+          ++ map unitName (filter isSshEntry inPhase);
       in concatMapStrings (unit: "${unit}\n")
       (unitsInPhase 1 ++ unitsInPhase 2);
     };

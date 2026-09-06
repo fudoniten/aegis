@@ -496,6 +496,112 @@ let
       ''}
     '';
 
+  # ---------------------------------------------------------------------------
+  # Profile verification, for the separately-deployed ciphertext case
+  #
+  # When `runtimePath` is set the .age files arrive as their own deploy-rs
+  # profile, and the activation that installs them has to be able to fail
+  # *before* it touches anything. Restarting a decrypt unit that then fails is
+  # not a recoverable state on a host whose sshd `Requires=` its host-key
+  # units: systemd propagates the failure and stops sshd, deploy-rs's
+  # magic-rollback health check cannot reconnect, and rolling the ciphertext
+  # profile back does not bring sshd up again.
+  #
+  # So the activation script runs this first, against the incoming profile
+  # directory rather than the live one. Every secret is decrypted to /dev/null
+  # with the identity its unit would use. Nothing is written, no unit is
+  # touched, and a profile that cannot be decrypted is rejected while the host
+  # is still running the previous one.
+  #
+  # Generated here rather than written in the deploy repo because this is
+  # where the entry list is: which secrets exist, and which identity opens
+  # each, is exactly what the manifest was parsed into above.
+  # ---------------------------------------------------------------------------
+  # Only entries whose ciphertext actually comes from the profile. A secret
+  # declared in Nix with `source = ./foo.age` still points into the store and
+  # is not the profile's to verify.
+  verifiableEntries = if cfg.runtimePath == null then
+    [ ]
+  else
+    filter (entry: hasPrefix "${cfg.runtimePath}/" entry.source) allEntries;
+
+  aegisVerifyProfile = pkgs.writeShellScriptBin "aegis-verify-profile" ''
+    set -euo pipefail
+
+    root="''${1:?usage: aegis-verify-profile <profile-directory>}"
+    host="$root/hosts/${hostname}"
+
+    if [ ! -d "$host" ]; then
+      echo "aegis-verify-profile: $host does not exist." >&2
+      echo "  The profile does not carry secrets for this host." >&2
+      exit 1
+    fi
+
+    # The manifest the running system was built against. The units, their
+    # targets and their ownership all come from it, so ciphertext described by
+    # a different one is not something this generation can deploy.
+    if [ -r /etc/aegis/manifest.sha256 ]; then
+      expected=$(cat /etc/aegis/manifest.sha256)
+      actual=$(${pkgs.coreutils}/bin/sha256sum "$host/secrets.toml" | cut -d' ' -f1)
+      if [ "$expected" != "$actual" ]; then
+        echo "aegis-verify-profile: manifest mismatch on ${hostname}." >&2
+        echo "  system generation was built against: $expected" >&2
+        echo "  this profile carries:                $actual" >&2
+        echo "" >&2
+        echo "  The set of secrets changed, so the units did too. Deploy the" >&2
+        echo "  system profile first, then this one." >&2
+        exit 1
+      fi
+    fi
+
+    failed=0
+    skipped=0
+
+    verify() {
+      local name="$1" identity="$2" source="$3"
+
+      # Sources are absolute under runtimePath; re-root them at the incoming
+      # profile, which is not linked into place yet.
+      local rel="''${source#${cfg.runtimePath}/}"
+      local path="$root/$rel"
+
+      if [ ! -r "$path" ]; then
+        echo "  FAIL $name: no ciphertext at $rel" >&2
+        failed=$((failed + 1))
+        return
+      fi
+
+      # A role key that phase 1 has not unwrapped yet is not this profile's
+      # fault -- on a first deploy it does not exist at all. Say so and move
+      # on rather than blocking the deploy that would create it.
+      if [ ! -r "$identity" ]; then
+        echo "  SKIP $name: identity $identity is not readable yet"
+        skipped=$((skipped + 1))
+        return
+      fi
+
+      if ! ${pkgs.age}/bin/age --decrypt --identity "$identity"              --output /dev/null "$path" 2>/dev/null; then
+        echo "  FAIL $name: cannot be decrypted with $identity" >&2
+        failed=$((failed + 1))
+        return
+      fi
+    }
+
+    ${concatMapStringsSep "\n" (entry:
+      "verify ${escapeShellArg entry.name} ${escapeShellArg entry.identity} ${
+        escapeShellArg entry.source
+      }") verifiableEntries}
+
+    if [ "$failed" -gt 0 ]; then
+      echo "aegis-verify-profile: $failed secret(s) failed on ${hostname}; refusing the profile." >&2
+      exit 1
+    fi
+
+    echo "aegis-verify-profile: ${
+      toString (length verifiableEntries)
+    } secret(s) verified on ${hostname} ($skipped skipped)."
+  '';
+
   mkSecretService = entry: {
     description = "Aegis: decrypt ${entry.name}${
         optionalString cfg.dryRun " (DRY-RUN)"
@@ -1166,7 +1272,22 @@ in {
     # machine.
     environment.etc = optionalAttrs (cfg.runtimePath != null && manifestExists) {
       "aegis/manifest.sha256".text = "${manifestSha256}\n";
+
+      # The units the ciphertext profile's activation should restart, in phase
+      # order, one per line. Generated here because the entry list is here;
+      # read by the activation script so the deploy repo does not have to
+      # reconstruct it from the manifest and get it subtly wrong.
+      "aegis/profile-units".text = let
+        unitsInPhase = phase:
+          map (entry: "aegis-${entry.name}.service")
+          (filter (entry: entry.phase == phase) verifiableEntries);
+      in concatMapStrings (unit: "${unit}\n")
+      (unitsInPhase 1 ++ unitsInPhase 2);
     };
+
+    # The verifier the activation script runs before touching any unit.
+    environment.systemPackages =
+      optional (cfg.runtimePath != null) aegisVerifyProfile;
 
     users.groups.aegis-secrets = { };
   };

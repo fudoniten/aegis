@@ -284,6 +284,35 @@ It is deliberately **not** checked at boot. A mismatch there could only be
 ignored or made fatal, and making it fatal on a host whose sshd requires its
 decrypted host keys turns a bookkeeping error into an unreachable machine.
 
+### Verifying before activating
+
+Setting `runtimePath` also puts `aegis-verify-profile` on the host. Give it
+the *incoming* profile directory and it decrypts every secret to `/dev/null`
+with the identity that secret's unit would use, checks the manifest
+fingerprint, and writes nothing:
+
+```
+$ aegis-verify-profile /nix/store/<hash>-aegis-ciphertext-myhost
+aegis-verify-profile: 7 secret(s) verified on myhost (0 skipped).
+```
+
+The activation script must run this **before** it restarts anything, and
+abort if it fails. Restarting a decrypt unit that then fails is not a
+recoverable state: sshd `Requires=` its host-key units, so systemd propagates
+the failure and stops sshd, deploy-rs's magic-rollback health check cannot
+reconnect, and rolling the ciphertext profile back does not bring sshd up
+again. Verified first, a bad profile is refused while the host is still
+running the previous one.
+
+A role key that phase 1 has not unwrapped yet is reported as skipped rather
+than failed — on a first deploy it does not exist at all, and blocking the
+deploy that would create it helps nobody.
+
+The units the activation should restart, in phase order, are listed in
+`/etc/aegis/profile-units`. Generated from the same entry list, so the deploy
+repo does not have to reconstruct it from the manifest and get it subtly
+wrong.
+
 ### What this does not solve
 
 Nothing here restarts the service that *consumes* a rotated secret. The

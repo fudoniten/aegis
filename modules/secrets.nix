@@ -30,16 +30,53 @@ let
   else
     null;
 
+  # Where the decrypt scripts read ciphertext from *at runtime*, which need not
+  # be where the manifest was read from *at evaluation time*.
+  #
+  # By default they are the same store path, and the whole aegis-secrets tree
+  # is a dependency of every unit script -- so rotating one secret on one host
+  # changes the closure of all of them.  Setting `runtimePath` points the
+  # scripts at a path outside the store instead (in practice a deploy-rs
+  # profile link), which takes the ciphertext out of the system closure and
+  # lets it be deployed on its own.
+  #
+  # The layout under `runtimePath` mirrors the repo's `deploy/` directory --
+  # `hosts/<host>/` and `roles/<role>/` -- because manifests name role secrets
+  # relative to the host directory and climb out of it
+  # (`../../roles/<role>/secrets/<name>.age`).  Anything that resolves under
+  # the repo has to resolve the same way here.
+  runtimeHostPath = if cfg.runtimePath != null then
+    "${cfg.runtimePath}/hosts/${hostname}"
+  else
+    hostSecretsPath;
+
   # The manifest is the single source of truth for what this host gets and
   # where it goes.  It is plain TOML so it can be read at evaluation time.
   manifestPath =
     if hostSecretsPath == null then null else "${hostSecretsPath}/secrets.toml";
   manifestExists = manifestPath != null && builtins.pathExists manifestPath;
 
+  # The context is discarded deliberately.  `readFile` on a store path yields a
+  # string that still refers to it, and every unit script below is built out of
+  # manifest values -- so without this, the whole aegis-secrets tree stays a
+  # runtime dependency of the system closure even once `runtimePath` has moved
+  # the ciphertext out of it.  Reading the file at evaluation time is exactly
+  # what is wanted; carrying the repo into the closure is not.
   manifest = if manifestExists then
-    builtins.fromTOML (builtins.readFile manifestPath)
+    builtins.fromTOML
+    (builtins.unsafeDiscardStringContext (builtins.readFile manifestPath))
   else
     { };
+
+  # sha256 of the manifest this system generation was built against, stamped
+  # into /etc so a deploy of the ciphertext profile can refuse to activate
+  # against a system that expects a different set of secrets.  See
+  # `runtimePath` below.
+  manifestSha256 = if manifestExists then
+    builtins.hashString "sha256"
+    (builtins.unsafeDiscardStringContext (builtins.readFile manifestPath))
+  else
+    null;
 
   # -------------------------------------------------------------------------
   # Manifest -> normalised secret list
@@ -52,7 +89,7 @@ let
 
   normaliseEntry = { name, kind, entry, defaultTarget ? null, defaultMode ? "0400" }: {
     inherit name kind;
-    source = "${hostSecretsPath}/${entry.source}";
+    source = "${runtimeHostPath}/${entry.source}";
     target = entry.target or defaultTarget;
     user = entry.user or "root";
     group = entry.group or "root";
@@ -91,7 +128,7 @@ let
     }) // {
       target = "${targetDir}/${stem}";
       # The public key ships in the clear alongside the encrypted private key
-      pubSource = "${hostSecretsPath}/${
+      pubSource = "${runtimeHostPath}/${
           removeSuffix ".age" entry.source
         }.pub";
       pubTarget = "${targetDir}/${stem}.pub";
@@ -144,7 +181,7 @@ let
   roleEntries = map (role: {
     name = "role-${role}";
     kind = "plain";
-    source = "${hostSecretsPath}/roles/${role}.age";
+    source = "${runtimeHostPath}/roles/${role}.age";
     target = "/run/aegis/roles/${role}";
     user = "root";
     group = "root";
@@ -157,7 +194,7 @@ let
   userKeyEntries = map (username: {
     name = "user-key-${username}";
     kind = "plain";
-    source = "${hostSecretsPath}/users/${username}/.key.age";
+    source = "${runtimeHostPath}/users/${username}/.key.age";
     target = "/run/aegis/users/${username}/.key";
     # Owned by the user: the phase-2 unit that consumes it runs as them, and
     # a root-owned 0400 key in a 0750 root directory is unreadable to it.
@@ -493,7 +530,7 @@ let
 
   userSecretsScript = username:
     let
-      userSecretsPath = "${hostSecretsPath}/users/${username}";
+      userSecretsPath = "${runtimeHostPath}/users/${username}";
       baseTarget = actualTarget "/run/aegis/users/${username}";
     in pkgs.writeShellScript "aegis-user-secrets-${username}" ''
       set -euo pipefail
@@ -738,11 +775,65 @@ in {
       example = "/path/to/aegis-secrets/deploy/hosts/myhost";
     };
 
+    runtimePath = mkOption {
+      type = types.nullOr types.str;
+      description = ''
+        Path the decrypt scripts read ciphertext from at runtime, instead of
+        the store path the manifest was read from.
+
+        Leave this null (the default) and Aegis behaves as it always has: the
+        unit scripts name `''${secretsPath}/<source>` directly, so the whole
+        aegis-secrets tree is part of the system closure. Rotating any secret
+        anywhere in the repo then changes the closure of every host that uses
+        it, and each one needs a full system deploy to pick the rotation up.
+
+        Set it and the ciphertext leaves the closure. The scripts then read
+        from `''${runtimePath}/hosts/<hostname>/<source>`, which is deployed
+        separately -- as a deploy-rs profile, typically
+        /nix/var/nix/profiles/aegis. Rotating a secret becomes a deploy of
+        that profile alone; the system generation only has to change when the
+        manifest does (a secret added, moved, or re-owned), because that is
+        what the units are generated from.
+
+        The tree it points at must mirror the repo's `deploy/` layout:
+
+          ''${runtimePath}/hosts/<hostname>/    the host's own directory
+          ''${runtimePath}/roles/<role>/        roles the host has secrets for
+
+        Both are needed even though only the first is named here: manifests
+        reach shared role secrets by climbing out of the host directory
+        (`../../roles/<role>/secrets/<name>.age`), and that has to resolve.
+
+        The manifest is still read from the store at evaluation time -- it has
+        to be, since the units, their ownership assertions and
+        `manifest.targets` are all generated from it. Only the ciphertext
+        moves. To keep the two from drifting, the manifest's sha256 is written
+        to /etc/aegis/manifest.sha256 when this is set, so the profile's
+        activation can refuse to install ciphertext the running system was not
+        built for.
+      '';
+      default = null;
+      example = "/nix/var/nix/profiles/aegis";
+    };
+
     resolvedSecretsPath = mkOption {
       type = types.nullOr types.str;
       description = "The host secrets directory actually in use (read-only).";
       default = if hostSecretsPath == null then null else toString hostSecretsPath;
       defaultText = literalExpression "secretsPath, or derived from secretsRepoPath";
+      readOnly = true;
+    };
+
+    resolvedRuntimePath = mkOption {
+      type = types.nullOr types.str;
+      description = ''
+        The host secrets directory the decrypt scripts actually read at
+        runtime (read-only). Equal to resolvedSecretsPath unless runtimePath
+        is set.
+      '';
+      default = if runtimeHostPath == null then null else toString runtimeHostPath;
+      defaultText =
+        literalExpression "''${runtimePath}/hosts/<hostname>, or resolvedSecretsPath";
       readOnly = true;
     };
 
@@ -1057,6 +1148,25 @@ in {
           requires = sshUnitNames;
         };
       };
+
+    # Fingerprint of the manifest this generation was built against.
+    #
+    # Only written when the ciphertext is deployed separately, because that is
+    # the only arrangement in which the two can disagree: the units come from
+    # the system profile and the .age files from another one, and a rollback
+    # of either alone leaves them describing different sets of secrets. The
+    # ciphertext profile's activation compares its own copy of secrets.toml
+    # against this and refuses to install a mismatch, so the drift is caught
+    # at deploy time -- where deploy-rs can still roll it back -- rather than
+    # at the next boot.
+    #
+    # Deliberately not checked at boot: a mismatch there would have to either
+    # be ignored or block phase 1, and blocking phase 1 on a host whose sshd
+    # requires its host keys turns a bookkeeping error into an unreachable
+    # machine.
+    environment.etc = optionalAttrs (cfg.runtimePath != null && manifestExists) {
+      "aegis/manifest.sha256".text = "${manifestSha256}\n";
+    };
 
     users.groups.aegis-secrets = { };
   };

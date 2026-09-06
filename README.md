@@ -98,6 +98,7 @@ Core module. Reads the manifest and generates a decryption unit per secret.
 | `enable` | bool | false | Enable Aegis secrets |
 | `secretsRepoPath` | null or path | null | Path to the aegis-secrets repo |
 | `secretsPath` | null or path | derived | This host's secrets directory, if not derived from the repo |
+| `runtimePath` | null or string | null | Read ciphertext from here at runtime instead of the store (see [Deploying secrets separately](#deploying-secrets-separately)) |
 | `masterKeyPath` | string | "/state/master-key/key" | Host's age private key |
 | `secrets` | attrsOf secret | {} | Extra secrets declared in Nix |
 | `roles` | list of string | from manifest | Roles this host has |
@@ -219,6 +220,78 @@ Defaults put most things under `/run/aegis/`:
 
 SSH host keys default to `/etc/ssh`, since that is where sshd expects them.
 
+## Deploying secrets separately
+
+By default the decrypt scripts name the `.age` files by their store path:
+
+```
+age --decrypt --identity /state/aegis/master-key \
+  --output "$TMP" "/nix/store/<hash>-aegis-secrets/deploy/hosts/myhost/keytab.age"
+```
+
+That store path is the *whole* aegis-secrets repo, so every host's system
+closure contains every host's ciphertext, and rotating one secret anywhere
+changes the closure of all of them. A rotation then costs a full system
+deploy per host.
+
+`runtimePath` breaks that coupling. Point it at a path outside the store and
+the scripts read from there instead:
+
+```nix
+aegis.secrets = {
+  enable = true;
+  secretsRepoPath = inputs.aegis-secrets;   # manifest, at evaluation time
+  runtimePath = "/nix/var/nix/profiles/aegis";  # ciphertext, at runtime
+};
+```
+
+The manifest is still read from the store when the system is built — it has
+to be, since the units, the ownership assertions and `manifest.targets` are
+all generated from it. Only the ciphertext moves. What you get is a split
+along the line that matters:
+
+| Change | Manifest | System closure | Deploy |
+|--------|----------|----------------|--------|
+| Rotate a secret (`aegis reencrypt`) | unchanged | unchanged | ciphertext profile alone |
+| Add, move, or re-own a secret | changed | changed | system, then ciphertext |
+
+### Layout
+
+The tree at `runtimePath` must mirror the repo's `deploy/` directory:
+
+```
+<runtimePath>/
+  hosts/<hostname>/      this host's directory, verbatim
+  roles/<role>/          each role this host has secrets for
+```
+
+Both halves are required even though only the host directory is named in the
+manifest: role secrets reach their shared ciphertext by climbing out of it
+(`../../roles/<role>/secrets/<name>.age`), and that has to resolve the same
+way it does inside the repo.
+
+### Drift
+
+The units come from one profile and the `.age` files from another, so the two
+can disagree — a rollback of either alone is enough to do it. When
+`runtimePath` is set, Aegis writes the manifest's sha256 to
+`/etc/aegis/manifest.sha256`; the ciphertext profile's activation script
+compares its own copy of `secrets.toml` against that and refuses to install a
+mismatch. The drift is then caught at deploy time, where deploy-rs can still
+roll it back.
+
+It is deliberately **not** checked at boot. A mismatch there could only be
+ignored or made fatal, and making it fatal on a host whose sshd requires its
+decrypted host keys turns a bookkeeping error into an unreachable machine.
+
+### What this does not solve
+
+Nothing here restarts the service that *consumes* a rotated secret. The
+decrypt unit rewrites the file; nginx, nebula or the KDC go on holding what
+they read at startup. That was already true of a system deploy, but a
+rotation-only deploy makes it the common case rather than a rare one, so plan
+on the profile's activation script restarting consumers explicitly.
+
 ## Two-Phase Decryption
 
 **Phase 1** (with host master key):
@@ -311,14 +384,21 @@ Enable it deliberately for a migration, verify, then turn it off.
 nix flake check
 ```
 
-Runs module evaluation plus five NixOS VM tests: basic decryption, two-phase
+Runs module evaluation plus six NixOS VM tests: basic decryption, two-phase
 role keys, service dependency ordering, manifest-driven deployment (target
-paths, ownership, modes, legacy base64 keytab unwrapping, sshd ordering), and
+paths, ownership, modes, legacy base64 keytab unwrapping, sshd ordering),
 role secrets (one shared ciphertext, phase-2 decryption with the role key,
-and the ordering that makes it reliable).
+and the ordering that makes it reliable), and `runtimePath` (ciphertext
+served from outside the store, including a rotation applied without a new
+system generation).
 
 `tests/ownership.nix` is evaluation-only rather than a VM test: what it checks
 is that a configuration *fails to evaluate*, which no VM can observe.
+
+`tests/runtime-path.nix` also contributes a build-time check,
+`runtime-path-closure`, which greps the generated decrypt scripts to confirm
+`runtimePath` really removes the secrets tree from the closure rather than
+merely adding an indirection.
 
 ## See Also
 

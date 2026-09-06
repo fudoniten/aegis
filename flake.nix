@@ -73,6 +73,16 @@
         # fails evaluation instead of reaching sshd. Evaluation-only.
         ssh-host-keys =
           import ./tests/ssh-host-keys.nix { inherit pkgs nixpkgs system; };
+
+        # Ciphertext served from outside the store (a deploy-rs profile),
+        # so secrets can be deployed without a system generation.
+        runtime-path =
+          (import ./tests/runtime-path.nix { inherit pkgs nixpkgs system; }).vm;
+
+        # ...and that this actually removes it from the system closure,
+        # rather than merely adding an indirection. Build-time.
+        runtime-path-closure =
+          (import ./tests/runtime-path.nix { inherit pkgs nixpkgs system; }).closure;
       } else
         { }));
   };

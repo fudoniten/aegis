@@ -537,21 +537,31 @@ let
       exit 1
     fi
 
-    # The manifest the running system was built against. The units, their
-    # targets and their ownership all come from it, so ciphertext described by
-    # a different one is not something this generation can deploy.
-    if [ -r /etc/aegis/manifest.sha256 ]; then
-      expected=$(cat /etc/aegis/manifest.sha256)
-      actual=$(${pkgs.coreutils}/bin/sha256sum "$host/secrets.toml" | cut -d' ' -f1)
-      if [ "$expected" != "$actual" ]; then
-        echo "aegis-verify-profile: manifest mismatch on ${hostname}." >&2
-        echo "  system generation was built against: $expected" >&2
-        echo "  this profile carries:                $actual" >&2
-        echo "" >&2
-        echo "  The set of secrets changed, so the units did too. Deploy the" >&2
-        echo "  system profile first, then this one." >&2
-        exit 1
-      fi
+    # The manifest this verifier was built from -- stamped in, not read from
+    # /etc.
+    #
+    # Reading /etc would tie the check to whichever generation happens to be
+    # running, which is wrong in the case that matters. The ciphertext has to
+    # be in place *before* the units that read it are restarted, so the
+    # ciphertext profile is deployed first and the running system is, at that
+    # moment, deliberately one step behind. Comparing against /etc there
+    # rejects exactly the deploy that is supposed to happen.
+    #
+    # Stamped, the check says the thing actually worth saying: this ciphertext
+    # and this verifier came out of the same evaluation of the host's config.
+    # The deploy repo invokes the verifier from the generation it is about to
+    # install, so the pair is checked against each other rather than against
+    # whatever is on the machine.
+    expected="${manifestSha256}"
+    actual=$(${pkgs.coreutils}/bin/sha256sum "$host/secrets.toml" | cut -d' ' -f1)
+    if [ "$expected" != "$actual" ]; then
+      echo "aegis-verify-profile: manifest mismatch on ${hostname}." >&2
+      echo "  this verifier was built against: $expected" >&2
+      echo "  this profile carries:            $actual" >&2
+      echo "" >&2
+      echo "  The ciphertext and the units come from different evaluations of" >&2
+      echo "  the host config. Rebuild both from one revision." >&2
+      exit 1
     fi
 
     failed=0
@@ -927,6 +937,24 @@ in {
       description = "The host secrets directory actually in use (read-only).";
       default = if hostSecretsPath == null then null else toString hostSecretsPath;
       defaultText = literalExpression "secretsPath, or derived from secretsRepoPath";
+      readOnly = true;
+    };
+
+    verifyProfilePackage = mkOption {
+      type = types.nullOr types.package;
+      description = ''
+        The `aegis-verify-profile` package for this host (read-only), or null
+        when runtimePath is unset.
+
+        Exposed so a deploy tool can run the verifier belonging to the
+        generation it is about to install, rather than the one already on the
+        machine. The two differ in exactly the case that matters: the
+        ciphertext profile is deployed before the system profile, so the
+        running generation's verifier knows the old set of secrets and the old
+        manifest, and would reject a correct deploy.
+      '';
+      default = if cfg.runtimePath == null then null else aegisVerifyProfile;
+      defaultText = literalExpression "the generated aegis-verify-profile package";
       readOnly = true;
     };
 

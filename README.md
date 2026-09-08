@@ -270,15 +270,34 @@ manifest: role secrets reach their shared ciphertext by climbing out of it
 (`../../roles/<role>/secrets/<name>.age`), and that has to resolve the same
 way it does inside the repo.
 
+### Ordering
+
+Deploy the ciphertext profile **before** the system profile.
+
+The decrypt units name their sources under `runtimePath`. Enabling
+`runtimePath`, or changing any secret's placement, changes those units — so
+`switch-to-configuration` restarts them. If the ciphertext is not linked yet,
+they fail, and on a host where sshd `Requires=` its host-key units that takes
+sshd down mid-deploy.
+
+Ciphertext first, and the ordering itself supplies the guarantee: the
+`.age` files are always at least as new as the units that read them. Nothing
+has to detect the bad interleaving because it cannot occur.
+
+The ciphertext profile's activation should therefore **not** restart units
+when the manifest differs from the running system's — the system profile
+following it will install the new units and start them against ciphertext
+that is already in place. It restarts only when the running system already
+agrees with the manifest, which is what a rotation looks like:
+`/etc/aegis/manifest.sha256` is written for exactly that test.
+
 ### Drift
 
 The units come from one profile and the `.age` files from another, so the two
-can disagree — a rollback of either alone is enough to do it. When
-`runtimePath` is set, Aegis writes the manifest's sha256 to
-`/etc/aegis/manifest.sha256`; the ciphertext profile's activation script
-compares its own copy of `secrets.toml` against that and refuses to install a
-mismatch. The drift is then caught at deploy time, where deploy-rs can still
-roll it back.
+can still disagree — a rollback of either alone is enough to do it. The
+verifier catches it: its expected manifest hash is stamped in at build time,
+so a ciphertext profile from a different evaluation than the verifier is
+refused before any unit is touched.
 
 It is deliberately **not** checked at boot. A mismatch there could only be
 ignored or made fatal, and making it fatal on a host whose sshd requires its
@@ -295,6 +314,14 @@ fingerprint, and writes nothing:
 $ aegis-verify-profile /nix/store/<hash>-aegis-ciphertext-myhost
 aegis-verify-profile: 7 secret(s) verified on myhost (0 skipped).
 ```
+
+The hash it checks is stamped into the verifier at build time, not read from
+`/etc`. That matters because of the deploy order: the ciphertext profile goes
+**first**, so the running generation is deliberately one step behind while it
+lands, and a check against `/etc` would reject exactly the deploy that is
+supposed to happen. Run the verifier belonging to the generation you are
+about to install — `aegis.secrets.verifyProfilePackage` exposes it — and the
+ciphertext and the units get checked against each other.
 
 The activation script must run this **before** it restarts anything, and
 abort if it fails. Restarting a decrypt unit that then fails is not a

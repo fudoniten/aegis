@@ -669,6 +669,13 @@ let
       # Rebuilt from scratch on every run. Without this, a secret removed from
       # the user's repo keeps working on every host that already has it: the
       # manifest stops listing it and nothing ever deletes the file.
+      #
+      # Only these two directories. A manifest entry with an explicit `target`
+      # is written outside them, and is not tracked anywhere, so removing it
+      # from the repo leaves it behind. Nothing produces such an entry today --
+      # `aegis-user add-file` has no --target -- and the Home Manager module
+      # places files rather than this script. If that changes, this needs a
+      # record of what it wrote, the way locket keeps one.
       rm -rf "$TARGET_DIR/env" "$TARGET_DIR/files"
       mkdir -p "$TARGET_DIR/env" "$TARGET_DIR/files"
       chown ${username}:${username} "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"

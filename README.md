@@ -67,13 +67,28 @@ aegis.secrets.secrets.my-api-key = {
 
 ## User secrets
 
-**Not working today.** The pieces exist — `aegis-tools-user` for the user,
-`aegis build user-secrets` for the admin, `aegis.secrets.users` and
-`aegis.userSecrets` here — but they do not agree on how the ciphertext is
-keyed, so nothing reaches a host. [TODO.md](./TODO.md) has the details and the
-decision that has to be made. Leave `aegis.secrets.users` empty until then.
+A user manages their own secrets in their own repo with
+[aegis-tools-user](../aegis-tools-user); the admin runs `aegis build
+user-secrets`, which re-encrypts them to each host that user is entitled to.
+On the host:
 
-The intended shape, for reference:
+```nix
+aegis.secrets.users = [ "niten" ];
+```
+
+That generates one phase-2 unit per user, which reads
+`users/<username>/manifest.age` from this host's secrets directory and
+decrypts what it lists into `/run/aegis/users/<username>/` — `env/<NAME>` for
+environment variables, `files/<name>` for files — owned by that user, mode
+`0400`, on tmpfs. A user with no manifest here is a no-op, so listing someone
+before their first `aegis build user-secrets` is safe.
+
+Like every other secret, these are encrypted to the **host master key**. There
+is no separate per-user deployment key: PLAN.md §4 specified one, nothing ever
+generated it, and it would protect nothing, since the unit that reads these
+files runs as root and chowns afterwards.
+
+Then, in Home Manager:
 
 ```nix
 { inputs, ... }:
@@ -83,15 +98,31 @@ The intended shape, for reference:
 
   aegis.userSecrets = {
     enable = true;
-    username = "niten";
 
-    sessionVariablesFromSecrets = [
-      "GITHUB_TOKEN"
-      "OPENAI_API_KEY"
-    ];
+    # Every env/<NAME> becomes $NAME at login. This is the default; there is
+    # no list to keep in sync with the user's repo.
+    exportAll = true;
+
+    # Files are placed where you say, since only you know where they belong.
+    files = {
+      aws-creds.target = ".aws/credentials";
+      ssh-work = {
+        target = ".ssh/id_work";
+        method = "copy";   # ssh rejects a symlinked key under StrictModes
+        mode = "0600";
+      };
+    };
   };
 }
 ```
+
+`exportAll` skips names that are not valid shell identifiers and refuses a
+short list — `PATH`, `LD_PRELOAD`, `IFS` and friends — that would change what
+the login shell does rather than supply a credential.
+
+File secrets default to `method = "symlink"`, which points into `/run`: no
+plaintext reaches the disk and it is gone after a reboot. `copy` is for
+programs that reject a symlink, and leaves a file behind that you own.
 
 ## Modules
 
@@ -149,8 +180,17 @@ principals.
 
 ### `aegis.userSecrets` (Home Manager)
 
-Exports secrets decrypted into `/run/aegis/users/<username>/env/` as session
-variables. Blocked on the user-secrets work in [TODO.md](./TODO.md).
+Turns what `aegis.secrets.users` decrypted into session variables and placed
+files. See [User secrets](#user-secrets).
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | false | Enable the module |
+| `username` | string | `home.username` | Whose secrets to read |
+| `secretsBasePath` | string | `/run/aegis/users/<username>` | Where they were decrypted |
+| `exportAll` | bool | **true** | Export every `env/<NAME>` as `$NAME` |
+| `sessionVariablesFromSecrets` | list of string | [] | Export only these, with `exportAll = false` |
+| `files` | attrsOf submodule | {} | Place `files/<name>` at `target`, by `symlink` or `copy` |
 
 ## Systemd Targets
 
@@ -212,7 +252,6 @@ Defaults put most things under `/run/aegis/`:
     kdc              # Role key (decrypted in phase 1, used in phase 2)
   users/
     niten/
-      .key           # User deployment key
       env/
         GITHUB_TOKEN # User env vars
       files/
@@ -358,11 +397,12 @@ on the profile's activation script restarting consumers explicitly.
 **Phase 1** (with host master key):
 - Host secrets (SSH keys, keytab, etc.)
 - Role keys (if this host has roles)
-- User deployment keys
 
-**Phase 2** (with keys from phase 1):
-- Role secrets (using the role key)
-- User secrets (using the user deployment key)
+**Phase 2**:
+- Role secrets (using the role key unwrapped in phase 1)
+- User secrets (with the host master key; they are in phase 2 so that
+  `aegis-phase2.target` means "role and user secrets are available", not
+  because they need anything phase 1 produced)
 
 This allows the KDC to decrypt all host keytabs (using the kdc role key), while
 each host can only decrypt its own keytab (using its host master key).
@@ -445,13 +485,15 @@ Enable it deliberately for a migration, verify, then turn it off.
 nix flake check
 ```
 
-Runs module evaluation plus six NixOS VM tests: basic decryption, two-phase
+Runs module evaluation plus seven NixOS VM tests: basic decryption, two-phase
 role keys, service dependency ordering, manifest-driven deployment (target
 paths, ownership, modes, legacy base64 keytab unwrapping, sshd ordering),
 role secrets (one shared ciphertext, phase-2 decryption with the role key,
-and the ordering that makes it reliable), and `runtimePath` (ciphertext
-served from outside the store, including a rotation applied without a new
-system generation).
+and the ordering that makes it reliable), user secrets (env vars, files, an
+explicit target, ownership the user can actually read, and the removal of
+anything the manifest no longer lists), and `runtimePath` (ciphertext served
+from outside the store, including a rotation applied without a new system
+generation).
 
 `tests/ownership.nix` is evaluation-only rather than a VM test: what it checks
 is that a configuration *fails to evaluate*, which no VM can observe.

@@ -1,8 +1,7 @@
 # Manifest-driven deployment: the module reads secrets.toml and honours the
 # target paths, ownership and permissions recorded there.
 #
-# This is the path that aegis-tools-system actually produces, and the one that
-# aegis.autoSecrets used to bypass.
+# This is the path that aegis-tools-system actually produces.
 { pkgs, ... }:
 
 let

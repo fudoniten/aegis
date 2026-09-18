@@ -65,15 +65,21 @@ aegis.secrets.secrets.my-api-key = {
 };
 ```
 
-## Home Manager Integration
+## User secrets
 
-For user environment variables from secrets:
+**Not working today.** The pieces exist — `aegis-tools-user` for the user,
+`aegis build user-secrets` for the admin, `aegis.secrets.users` and
+`aegis.userSecrets` here — but they do not agree on how the ciphertext is
+keyed, so nothing reaches a host. [TODO.md](./TODO.md) has the details and the
+decision that has to be made. Leave `aegis.secrets.users` empty until then.
+
+The intended shape, for reference:
 
 ```nix
 { inputs, ... }:
 
 {
-  imports = [ inputs.aegis.homeManagerModules.default ];
+  imports = [ inputs.aegis.homeManagerModules.userSecrets ];
 
   aegis.userSecrets = {
     enable = true;
@@ -141,15 +147,10 @@ Principals that exist only in the live database — users created on the KDC wit
 `kadmin` — are preserved; the repo stays authoritative for host and service
 principals.
 
-### `aegis.autoSecrets` (NixOS) — deprecated
-
-A compatibility shim that forwards to `aegis.secrets` and warns. It used to
-discover secrets by globbing the build directory, ignoring `secrets.toml`, which
-made it a second and divergent source of truth. Migrate to `aegis.secrets`.
-
 ### `aegis.userSecrets` (Home Manager)
 
-Exports decrypted secrets as environment variables.
+Exports secrets decrypted into `/run/aegis/users/<username>/env/` as session
+variables. Blocked on the user-secrets work in [TODO.md](./TODO.md).
 
 ## Systemd Targets
 
@@ -462,6 +463,7 @@ merely adding an indirection.
 
 ## See Also
 
-- [PLAN.md](./PLAN.md) - Original architecture notes
+- [TODO.md](./TODO.md) - Known gaps and what has to be decided
+- [PLAN.md](./PLAN.md) - Original architecture notes (historical, not current)
 - [aegis-tools-system](../aegis-tools-system) - Admin CLI tools
 - [aegis-tools-user](../aegis-tools-user) - User CLI tools

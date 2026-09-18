@@ -191,6 +191,20 @@ let
     identity = cfg.masterKeyPath;
   }) cfg.roles;
 
+  # TODO(user-secrets): this never succeeds -- see ../TODO.md.
+  #
+  # PLAN.md's "User Keys (Two-Layer System)" specifies a per-host user
+  # deployment key at users/<username>/.key.age, encrypted to the host.  The
+  # second layer was never built: `aegis user add` writes the user's private
+  # key to keys/users/<username>.age, encrypted to admins only, and nothing in
+  # aegis-tools-system ever emits a .key.age.  This unit therefore fails, and
+  # aegis-user-secrets-<username> `Requires=` it, so user secrets never run.
+  #
+  # The contents disagree too: `aegis build user-secrets` encrypts both the
+  # manifest and each secret to the *host* key, not to any user key, so even a
+  # .key.age that existed would decrypt nothing.
+  #
+  # Resolving it means choosing one layer or the other, not patching both.
   userKeyEntries = map (username: {
     name = "user-key-${username}";
     kind = "plain";
@@ -1012,7 +1026,12 @@ in {
 
     users = mkOption {
       type = types.listOf types.str;
-      description = "Users whose secrets should be decrypted on this host.";
+      description = ''
+        Users whose secrets should be decrypted on this host.
+
+        Setting this currently produces units that cannot succeed; see
+        ../TODO.md. Leave it empty until that is resolved.
+      '';
       default = [ ];
     };
 

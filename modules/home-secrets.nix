@@ -1,4 +1,19 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, ... }:
+
+# Exports secrets that `aegis.secrets` decrypted for this user as session
+# variables.
+#
+# This module is the last link in the user-secrets chain, and the chain is
+# currently broken upstream of it: nothing decrypts anything into
+# `secretsBasePath`, so every variable here resolves to nothing.  See
+# ../TODO.md ("User secrets do not work end to end") before relying on it.
+#
+# What it expects to find, once that is fixed:
+#
+#   /run/aegis/users/<username>/env/<NAME>    one variable per file
+#   /run/aegis/users/<username>/files/<name>  file secrets
+#
+# written by the phase-2 unit in ../modules/secrets.nix.
 
 with lib;
 
@@ -20,24 +35,14 @@ in {
       default = "/run/aegis/users/${cfg.username}";
     };
 
-    envVars = mkOption {
-      type = types.attrsOf types.str;
-      description = ''
-        Environment variables from secrets.
-        Keys are variable names, values are paths to decrypted secret files.
-      '';
-      default = { };
-      example = {
-        GITHUB_TOKEN = "/run/aegis/users/niten/env/GITHUB_TOKEN";
-        OPENAI_API_KEY = "/run/aegis/users/niten/env/OPENAI_API_KEY";
-      };
-    };
-
     sessionVariablesFromSecrets = mkOption {
       type = types.listOf types.str;
       description = ''
-        List of secret names to export as session variables.
-        These will be read from secretsBasePath/env/<name> at login time.
+        Secret names to export as session variables. Each is read from
+        <literal>secretsBasePath/env/&lt;name&gt;</literal> at login.
+
+        A name that has no file is skipped rather than exported empty, so a
+        host that is not entitled to a secret simply does not set it.
       '';
       default = [ ];
       example = [ "GITHUB_TOKEN" "OPENAI_API_KEY" ];
@@ -45,21 +50,17 @@ in {
   };
 
   config = mkIf cfg.enable {
-    # Source the secrets into the session
-    # This creates a script that reads secret files and exports them
+    # Read at login by the shell, not at evaluation time: the plaintext must
+    # never reach the Nix store, and it does not exist when the config is
+    # built.
     home.sessionVariablesExtra =
       mkIf (cfg.sessionVariablesFromSecrets != [ ]) ''
         # Aegis user secrets
         ${concatMapStringsSep "\n" (name: ''
-          if [ -f "${cfg.secretsBasePath}/env/${name}" ]; then
+          if [ -r "${cfg.secretsBasePath}/env/${name}" ]; then
             export ${name}="$(cat "${cfg.secretsBasePath}/env/${name}")"
           fi
         '') cfg.sessionVariablesFromSecrets}
       '';
-
-    # For explicitly mapped env vars
-    home.sessionVariables =
-      mapAttrs (name: path: "$(cat ${path} 2>/dev/null || echo '')")
-      cfg.envVars;
   };
 }

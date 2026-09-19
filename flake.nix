@@ -12,14 +12,8 @@
       # KDC database management from the per-realm principal bundle
       kdc = import ./modules/kdc.nix;
 
-      # Deprecated compatibility shim for the old aegis.autoSecrets options
-      autoSecrets = import ./modules/auto-secrets.nix;
-
-      # Default: the core module plus the deprecated shim, so existing
-      # configurations keep evaluating while they migrate.
-      default = {
-        imports = [ ./modules/secrets.nix ./modules/auto-secrets.nix ];
-      };
+      # Default: the core secrets module.
+      default = import ./modules/secrets.nix;
     };
 
     # Home Manager modules
@@ -36,7 +30,6 @@
         moduleEval = pkgs.runCommand "aegis-module-eval-test" { } ''
           echo "Module files exist:"
           test -f ${./modules/secrets.nix}
-          test -f ${./modules/auto-secrets.nix}
           test -f ${./modules/home-secrets.nix}
           test -f ${./modules/kdc.nix}
           echo "OK"
@@ -62,6 +55,11 @@
         # Secrets encrypted to a role: one shared ciphertext, decrypted in
         # phase 2 with the role key the host unwrapped in phase 1
         role-secret = import ./tests/role-secret.nix { inherit pkgs; };
+
+        # A user's own secrets, decrypted from their repo's build output:
+        # env vars, files, an explicit target, ownership, and the removal of
+        # anything the manifest no longer lists.
+        user-secrets = import ./tests/user-secrets.nix { inherit pkgs; };
 
         # A secret owned by a user or group the host does not declare fails
         # evaluation instead of failing chown at boot. Evaluation-only.

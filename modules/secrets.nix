@@ -191,20 +191,23 @@ let
     identity = cfg.masterKeyPath;
   }) cfg.roles;
 
-  userKeyEntries = map (username: {
-    name = "user-key-${username}";
-    kind = "plain";
-    source = "${runtimeHostPath}/users/${username}/.key.age";
-    target = "/run/aegis/users/${username}/.key";
-    # Owned by the user: the phase-2 unit that consumes it runs as them, and
-    # a root-owned 0400 key in a 0750 root directory is unreadable to it.
-    user = username;
-    group = username;
-    mode = "0400";
-    encoding = null;
-    phase = 1;
-    identity = cfg.masterKeyPath;
-  }) cfg.users;
+  # There is deliberately no per-user deployment key here.
+  #
+  # PLAN.md's "User Keys (Two-Layer System)" called for one: a key at
+  # users/<username>/.key.age, decrypted in phase 1 and used in phase 2 to
+  # unwrap that user's secrets.  aegis-tools-system never built that layer --
+  # `aegis build user-secrets` encrypts the manifest and every user secret to
+  # the *host* master key, exactly like any other host secret -- so for years
+  # this module generated a phase-1 unit for a file that is never produced,
+  # and a phase-2 unit that `Requires=` it, which is why user secrets have
+  # never worked.
+  #
+  # The second layer was dropped rather than built.  It protects nothing that
+  # is not already protected: the phase-2 unit runs as root and chowns
+  # afterwards, so the user never holds a key of their own, and a second key
+  # on the same disk, decrypted by the first, adds a rotation step and no
+  # boundary.  Users keep a key for getting secrets *into* aegis-secrets, in
+  # keys/users/<username>.age; that one is real and unchanged.
 
   # Secrets declared directly in Nix, for anything the manifest cannot express
   manualEntries = mapAttrsToList (name: secretCfg: {
@@ -221,7 +224,7 @@ let
   }) cfg.secrets;
 
   allEntries = sshEntries ++ keytabEntries ++ nexusEntries ++ extraEntries
-    ++ roleEntries ++ userKeyEntries ++ manualEntries;
+    ++ roleEntries ++ manualEntries;
 
   # -------------------------------------------------------------------------
   # Ownership validation
@@ -651,18 +654,29 @@ let
     in pkgs.writeShellScript "aegis-user-secrets-${username}" ''
       set -euo pipefail
 
-      USER_KEY="${actualTarget "/run/aegis/users/${username}/.key"}"
+      IDENTITY="${cfg.masterKeyPath}"
       MANIFEST_ENC="${userSecretsPath}/manifest.age"
       SECRETS_DIR="${userSecretsPath}/secrets"
       TARGET_DIR="${baseTarget}"
 
       echo "${dryRunPrefix}Decrypting secrets for user ${username}"
 
-      if [ ! -r "$USER_KEY" ]; then
-        echo "ERROR: User deployment key not readable: $USER_KEY"
+      if [ ! -r "$IDENTITY" ]; then
+        echo "ERROR: Host master key not readable: $IDENTITY"
         exit 1
       fi
 
+      # Rebuilt from scratch on every run. Without this, a secret removed from
+      # the user's repo keeps working on every host that already has it: the
+      # manifest stops listing it and nothing ever deletes the file.
+      #
+      # Only these two directories. A manifest entry with an explicit `target`
+      # is written outside them, and is not tracked anywhere, so removing it
+      # from the repo leaves it behind. Nothing produces such an entry today --
+      # `aegis-user add-file` has no --target -- and the Home Manager module
+      # places files rather than this script. If that changes, this needs a
+      # record of what it wrote, the way locket keeps one.
+      rm -rf "$TARGET_DIR/env" "$TARGET_DIR/files"
       mkdir -p "$TARGET_DIR/env" "$TARGET_DIR/files"
       chown ${username}:${username} "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
       chmod 0700 "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
@@ -676,7 +690,7 @@ let
       trap 'rm -f "$MANIFEST_TMP"' EXIT
 
       ${pkgs.age}/bin/age --decrypt \
-        --identity "$USER_KEY" \
+        --identity "$IDENTITY" \
         --output "$MANIFEST_TMP" \
         "$MANIFEST_ENC"
 
@@ -716,7 +730,7 @@ let
 
         echo "${dryRunPrefix}Decrypting $actual_name -> $TARGET_FILE"
         ${pkgs.age}/bin/age --decrypt \
-          --identity "$USER_KEY" \
+          --identity "$IDENTITY" \
           --output "$TARGET_FILE" \
           "$SOURCE_FILE"
 
@@ -736,8 +750,11 @@ let
       }";
     wantedBy = [ "aegis-phase2.target" ];
     before = [ "aegis-phase2.target" ];
-    after = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
-    requires = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
+    # Phase 2 by convention rather than by need: these decrypt with the host
+    # master key, so nothing from phase 1 is required. Keeping them here keeps
+    # aegis-phase2.target meaning "role and user secrets are available", which
+    # is what the README documents and what services order against.
+    after = [ "aegis-phase1.target" ];
 
     restartIfChanged = true;
     stopIfChanged = false;
@@ -1012,7 +1029,22 @@ in {
 
     users = mkOption {
       type = types.listOf types.str;
-      description = "Users whose secrets should be decrypted on this host.";
+      description = ''
+        Users whose secrets should be decrypted on this host.
+
+        Each named user gets a phase-2 unit that reads
+        <literal>users/&lt;username&gt;/manifest.age</literal> from this host's
+        secrets directory and decrypts what it lists into
+        <literal>/run/aegis/users/&lt;username&gt;/</literal>: environment
+        variables under <literal>env/</literal>, files under
+        <literal>files/</literal>.
+
+        A user with no manifest in this host's directory is a no-op -- the unit
+        logs that it found nothing and succeeds -- so listing a user before
+        <literal>aegis build user-secrets</literal> has run for them is safe.
+        The user must exist on the host, since the decrypted files are chowned
+        to them.
+      '';
       default = [ ];
     };
 
@@ -1159,10 +1191,28 @@ in {
         assertion = !(cfg.users != [ ] && !manifestExists);
         message = ''
           aegis.secrets.users is set for ${hostname} but no manifest was found,
-          so there are no user deployment keys to decrypt.
+          so there is nothing to decrypt for them.
         '';
       }
-    ] ++ optionals (!cfg.dryRun) (map (problem: {
+    ] ++ optionals (!cfg.dryRun) (map (username: {
+      # The phase-2 unit runs as root and chowns to the user. It has no entry
+      # in allEntries, so the general ownership check above does not see it --
+      # without this, a user aegis-secrets knows about but the host does not
+      # declare fails at chown, at boot, after the plaintext is written.
+      assertion = knownUser username;
+      message = ''
+        Aegis on ${hostname} is configured to decrypt secrets for user
+        "${username}", but no such user is declared on this host.
+
+        aegis-user-secrets-${username}.service writes to
+        /run/aegis/users/${username}/ and then fails at `chown ${username}`,
+        leaving that user's secrets owned by root.
+
+        Either declare the user on this host, remove them from
+        aegis.secrets.users, or -- if the account genuinely lives outside the
+        NixOS user database -- list them in aegis.secrets.unmanagedUsers.
+      '';
+    }) cfg.users) ++ optionals (!cfg.dryRun) (map (problem: {
       assertion = false;
       message = problem;
     }) deployProblems) ++ map (role: {

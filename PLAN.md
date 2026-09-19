@@ -1,5 +1,23 @@
 # Aegis - Encrypted Secrets Management for NixOS
 
+> **Historical.** These are the notes the system was designed from, kept for the
+> reasoning rather than as a description of what exists. Where it disagrees with
+> the code, the code wins — with one deliberate exception, noted below.
+>
+> Known divergences:
+>
+> | PLAN.md says | Reality |
+> |---|---|
+> | `aegis-secrets/hosts/<hostname>/` | `deploy/hosts/<hostname>/`, generated from `src/hosts/<hostname>.toml` |
+> | `aegis-secrets/.user-keys/<user>.age` | `keys/users/<user>.age` |
+> | `aegis add-user` / `aegis build-user-secrets` | `aegis user add` / `aegis build user-secrets` (old names still work as aliases) |
+> | `build/hosts/` bundles | `deploy/hosts/`; `build/` is the legacy name the module still falls back to |
+>
+> The exception is **§4, User Keys (Two-Layer System)**. That section describes
+> a design the NixOS module was written against and `aegis-tools-system` never
+> implemented — it is the reason user secrets do not work. Read it as an open
+> proposal, not as history. See [TODO.md](./TODO.md).
+
 ## Overview
 
 Aegis replaces the unencrypted `fudo-secrets` monorepo with an encrypted system where:

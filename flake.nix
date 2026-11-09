@@ -63,6 +63,10 @@
         # phase 2 with the role key the host unwrapped in phase 1
         role-secret = import ./tests/role-secret.nix { inherit pkgs; };
 
+        # Per-user secrets, decrypted with the host master key and owned by
+        # the user and their primary group
+        user-secrets = import ./tests/user-secrets.nix { inherit pkgs; };
+
         # A secret owned by a user or group the host does not declare fails
         # evaluation instead of failing chown at boot. Evaluation-only.
         ownership =

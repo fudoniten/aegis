@@ -138,6 +138,46 @@ let
       ok = !(mentions "\"1234\"" msgs);
       why = "a numeric uid/gid must not be treated as a missing account";
     };
+
+    # User secrets chown to the user and a group.  The group is the account's
+    # primary group: there is no per-user group named after the user unless
+    # something declares one, so assuming it fails every ordinary account.
+    user-secrets-use-primary-group = let
+      msgs = failedMessages {
+        imports = [ (base { user = "root"; group = "root"; }) ];
+        users.users.alice = {
+          isNormalUser = true;
+          group = "fudo";
+        };
+        users.groups.fudo = { };
+        aegis.secrets.users = [ "alice" ];
+      };
+    in {
+      ok = !(mentions "group \"alice\"" msgs) && !(mentions "user \"alice\"" msgs);
+      why = "a user's secrets must be owned by their primary group, not a group named after them";
+    };
+
+    user-secrets-missing-user-fails = let
+      msgs = failedMessages {
+        imports = [ (base { user = "root"; group = "root"; }) ];
+        aegis.secrets.users = [ missingUser ];
+      };
+    in {
+      ok = mentions "user \"${missingUser}\"" msgs;
+      why = "user secrets for an undeclared account must fail evaluation";
+    };
+
+    user-groups-override-is-validated = let
+      msgs = failedMessages {
+        imports = [ (base { user = "root"; group = "root"; }) ];
+        users.users.alice.isNormalUser = true;
+        aegis.secrets.users = [ "alice" ];
+        aegis.secrets.userGroups.alice = missingGroup;
+      };
+    in {
+      ok = mentions "group \"${missingGroup}\"" msgs;
+      why = "aegis.secrets.userGroups must be used, and validated like any owner";
+    };
   };
 
   failed = lib.filterAttrs (_: case: !case.ok) cases;

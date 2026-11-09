@@ -117,11 +117,9 @@ aegis-secrets/                       Phase 1: Decrypt with master-key
 - **Private key**: Stored in `aegis-secrets/.user-keys/<username>.age` (encrypted for admin)
 - **Public key**: Given to user, stored in their repo
 
-**User Deployment Key** (for central repo -> hosts):
-- **Purpose**: Decrypt consolidated user secrets on target hosts  
-- **Generation**: Created alongside user repo key
-- **Private key**: Encrypted for target hosts in `aegis-secrets/users/<username>/.key.age`
-- **Used by**: Phase 2 decryption on hosts
+**User Deployment Key**: dropped.  Consolidated user secrets are encrypted to
+each target host's master key, which is what the host decrypts them with; no
+user private key is copied to hosts.
 
 ### 5. Admin Key
 - **Purpose**: Admin can decrypt/edit all secrets

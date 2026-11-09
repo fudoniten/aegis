@@ -102,7 +102,8 @@ Core module. Reads the manifest and generates a decryption unit per secret.
 | `masterKeyPath` | string | "/state/master-key/key" | Host's age private key |
 | `secrets` | attrsOf secret | {} | Extra secrets declared in Nix |
 | `roles` | list of string | from manifest | Roles this host has |
-| `users` | list of string | [] | Users whose secrets to decrypt |
+| `users` | list of string | [] | Users whose secrets to decrypt; must match the user's host list in aegis-secrets |
+| `userGroups` | attrs of string | {} | Group owning a user's secrets, by username (default: their primary group, else `users`) |
 | `unmanagedUsers` | list of string | [] | Owners that exist outside `users.users` (escape hatch) |
 | `unmanagedGroups` | list of string | [] | Owners that exist outside `users.groups` (escape hatch) |
 | `manageSshd` | bool | true | Make sshd require the units that decrypt its host keys |
@@ -210,8 +211,7 @@ Defaults put most things under `/run/aegis/`:
   roles/
     kdc              # Role key (decrypted in phase 1, used in phase 2)
   users/
-    niten/
-      .key           # User deployment key
+    niten/           # owned by niten and their primary group
       env/
         GITHUB_TOKEN # User env vars
       files/
@@ -357,11 +357,11 @@ on the profile's activation script restarting consumers explicitly.
 **Phase 1** (with host master key):
 - Host secrets (SSH keys, keytab, etc.)
 - Role keys (if this host has roles)
-- User deployment keys
 
-**Phase 2** (with keys from phase 1):
+**Phase 2** (after phase 1):
 - Role secrets (using the role key)
-- User secrets (using the user deployment key)
+- User secrets (using the host master key: `aegis build user-secrets`
+  encrypts them to each host the user may reach)
 
 This allows the KDC to decrypt all host keytabs (using the kdc role key), while
 each host can only decrypt its own keytab (using its host master key).

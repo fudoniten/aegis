@@ -191,19 +191,24 @@ let
     identity = cfg.masterKeyPath;
   }) cfg.roles;
 
-  userKeyEntries = map (username: {
-    name = "user-key-${username}";
-    kind = "plain";
-    source = "${runtimeHostPath}/users/${username}/.key.age";
-    target = "/run/aegis/users/${username}/.key";
-    # Owned by the user: the phase-2 unit that consumes it runs as them, and
-    # a root-owned 0400 key in a 0750 root directory is unreadable to it.
+  # The group a user's secrets are chowned to: an explicit
+  # aegis.secrets.userGroups entry, else the account's own primary group, else
+  # "users" (what NixOS gives an isNormalUser account without one).  Never the
+  # username itself: a per-user group of that name exists only if something
+  # declared it, and on most hosts nothing does.
+  userGroup = username:
+    cfg.userGroups.${username} or (let
+      declared = (config.users.users.${username} or { }).group or "";
+    in if declared != "" then declared else "users");
+
+  # Not decrypt entries -- user secrets have their own unit, below -- but they
+  # chown to an owner all the same, so they go through the same ownership
+  # validation as everything else.
+  userOwnerEntries = map (username: {
+    name = "user-secrets-${username}";
+    target = "/run/aegis/users/${username}";
     user = username;
-    group = username;
-    mode = "0400";
-    encoding = null;
-    phase = 1;
-    identity = cfg.masterKeyPath;
+    group = userGroup username;
   }) cfg.users;
 
   # Secrets declared directly in Nix, for anything the manifest cannot express
@@ -221,7 +226,10 @@ let
   }) cfg.secrets;
 
   allEntries = sshEntries ++ keytabEntries ++ nexusEntries ++ extraEntries
-    ++ roleEntries ++ userKeyEntries ++ manualEntries;
+    ++ roleEntries ++ manualEntries;
+
+  # Everything that ends in a chown, for ownership validation.
+  ownedEntries = allEntries ++ userOwnerEntries;
 
   # -------------------------------------------------------------------------
   # Ownership validation
@@ -274,12 +282,12 @@ let
   # secrets underneath says more than five copies of the same message.
   secretsOwnedBy = field: owner:
     map (entry: "${entry.name} -> ${entry.target}")
-    (filter (entry: entry.${field} == owner) allEntries);
+    (filter (entry: entry.${field} == owner) ownedEntries);
 
   missingUsers =
-    filter (user: !knownUser user) (unique (map (entry: entry.user) allEntries));
+    filter (user: !knownUser user) (unique (map (entry: entry.user) ownedEntries));
   missingGroups = filter (group: !knownGroup group)
-    (unique (map (entry: entry.group) allEntries));
+    (unique (map (entry: entry.group) ownedEntries));
 
   missingUserMessage = user: ''
     Aegis on ${hostname} deploys secrets owned by user "${user}", but no such
@@ -644,27 +652,31 @@ let
   # User secrets (phase 2)
   # -------------------------------------------------------------------------
 
+  # The ciphertext and its manifest are encrypted to this host's master key
+  # (aegis build user-secrets), so that is the identity used for both.  There
+  # is no per-user key on the host.
   userSecretsScript = username:
     let
       userSecretsPath = "${runtimeHostPath}/users/${username}";
       baseTarget = actualTarget "/run/aegis/users/${username}";
+      owner = "${username}:${userGroup username}";
     in pkgs.writeShellScript "aegis-user-secrets-${username}" ''
       set -euo pipefail
 
-      USER_KEY="${actualTarget "/run/aegis/users/${username}/.key"}"
+      MASTER_KEY="${cfg.masterKeyPath}"
       MANIFEST_ENC="${userSecretsPath}/manifest.age"
       SECRETS_DIR="${userSecretsPath}/secrets"
       TARGET_DIR="${baseTarget}"
 
       echo "${dryRunPrefix}Decrypting secrets for user ${username}"
 
-      if [ ! -r "$USER_KEY" ]; then
-        echo "ERROR: User deployment key not readable: $USER_KEY"
+      if [ ! -r "$MASTER_KEY" ]; then
+        echo "ERROR: Master key not readable: $MASTER_KEY"
         exit 1
       fi
 
       mkdir -p "$TARGET_DIR/env" "$TARGET_DIR/files"
-      chown ${username}:${username} "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
+      chown ${owner} "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
       chmod 0700 "$TARGET_DIR" "$TARGET_DIR/env" "$TARGET_DIR/files"
 
       if [ ! -f "$MANIFEST_ENC" ]; then
@@ -673,27 +685,40 @@ let
       fi
 
       MANIFEST_TMP=$(mktemp)
-      trap 'rm -f "$MANIFEST_TMP"' EXIT
+      LIST_TMP=$(mktemp)
+      trap 'rm -f "$MANIFEST_TMP" "$LIST_TMP"' EXIT
 
       ${pkgs.age}/bin/age --decrypt \
-        --identity "$USER_KEY" \
+        --identity "$MASTER_KEY" \
         --output "$MANIFEST_TMP" \
         "$MANIFEST_ENC"
 
       # Manifest format (YAML):
       #   secrets:
-      #     <hashed_name>.age:
+      #     <hash>.age:
       #       name: <actual_name>
       #       type: env|file
       #       target: <optional target path for files>
+      #
+      # Written to a file first, not piped into the loop: a pipe would run the
+      # loop in a subshell, and FAILED below would not survive it.
       ${pkgs.yq-go}/bin/yq e \
         '.secrets | to_entries | .[] | [.key, .value.name, .value.type, .value.target // ""] | @tsv' \
-        "$MANIFEST_TMP" | \
+        "$MANIFEST_TMP" > "$LIST_TMP"
+
+      FAILED=0
       while IFS=$'\t' read -r hashed_file actual_name secret_type target_path; do
         SOURCE_FILE="$SECRETS_DIR/$hashed_file"
 
+        # Manifests built before the key carried its suffix name "<hash>"
+        # for a file written as "<hash>.age".
+        if [ ! -f "$SOURCE_FILE" ] && [ -f "$SOURCE_FILE.age" ]; then
+          SOURCE_FILE="$SOURCE_FILE.age"
+        fi
+
         if [ ! -f "$SOURCE_FILE" ]; then
-          echo "WARNING: Secret file not found: $SOURCE_FILE (for $actual_name)"
+          echo "ERROR: Secret file not found: $SOURCE_FILE (for $actual_name)"
+          FAILED=1
           continue
         fi
 
@@ -715,29 +740,37 @@ let
         mkdir -p "$(dirname "$TARGET_FILE")"
 
         echo "${dryRunPrefix}Decrypting $actual_name -> $TARGET_FILE"
-        ${pkgs.age}/bin/age --decrypt \
-          --identity "$USER_KEY" \
+        if ! ${pkgs.age}/bin/age --decrypt \
+          --identity "$MASTER_KEY" \
           --output "$TARGET_FILE" \
-          "$SOURCE_FILE"
+          "$SOURCE_FILE"; then
+          echo "ERROR: Could not decrypt $actual_name"
+          FAILED=1
+          continue
+        fi
 
-        chown ${username}:${username} "$TARGET_FILE"
+        chown ${owner} "$TARGET_FILE"
         chmod 0400 "$TARGET_FILE"
-      done
+      done < "$LIST_TMP"
+
+      if [ "$FAILED" -ne 0 ]; then
+        echo "${dryRunPrefix}Some secrets for ${username} could not be decrypted"
+        exit 1
+      fi
 
       echo "${dryRunPrefix}User secrets for ${username} decrypted successfully"
     '';
 
   # Runs as root and chowns to the user, rather than running as the user.
   # Running as the user cannot work: the unit has to create directories under
-  # /run/aegis/users, which root owns.
+  # /run/aegis/users, which root owns, and read the master key.
   mkUserSecretsService = username: {
     description = "Aegis: decrypt secrets for user ${username}${
         optionalString cfg.dryRun " (DRY-RUN)"
       }";
     wantedBy = [ "aegis-phase2.target" ];
     before = [ "aegis-phase2.target" ];
-    after = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
-    requires = [ "aegis-phase1.target" "aegis-user-key-${username}.service" ];
+    after = [ "aegis-phase1.target" ];
 
     restartIfChanged = true;
     stopIfChanged = false;
@@ -1012,8 +1045,29 @@ in {
 
     users = mkOption {
       type = types.listOf types.str;
-      description = "Users whose secrets should be decrypted on this host.";
+      description = ''
+        Users whose secrets should be decrypted on this host, from
+        users/<user>/ in the host secrets directory (written by
+        'aegis build user-secrets').  Each lands in /run/aegis/users/<user>,
+        decrypted with the host master key and owned by the user.
+
+        This must match the host list in the user's src/users/<user>.toml:
+        a user listed here whose secrets were not built for this host just
+        gets an empty directory.
+      '';
       default = [ ];
+      example = [ "alice" ];
+    };
+
+    userGroups = mkOption {
+      type = types.attrsOf types.str;
+      description = ''
+        Group to own each user's secrets, by username.  Users not listed get
+        the primary group of their account (users.users.<user>.group), or
+        "users" if it has none.
+      '';
+      default = { };
+      example = { alice = "staff"; };
     };
 
     unmanagedUsers = mkOption {
@@ -1159,7 +1213,7 @@ in {
         assertion = !(cfg.users != [ ] && !manifestExists);
         message = ''
           aegis.secrets.users is set for ${hostname} but no manifest was found,
-          so there are no user deployment keys to decrypt.
+          so this host has not been built and has no user secrets to decrypt.
         '';
       }
     ] ++ optionals (!cfg.dryRun) (map (problem: {

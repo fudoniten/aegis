@@ -70,25 +70,42 @@ aegis.secrets.secrets.my-api-key = {
 
 ## Home Manager Integration
 
-For user environment variables from secrets:
+A user's secrets are decrypted on each of their hosts to
+`/run/aegis/users/<user>/files/<name>` (from `aegis-user add-file`) and
+`/run/aegis/users/<user>/env/<NAME>` (from `aegis-user add-env`).
+
+Env secrets need no configuration: the NixOS module exports every one of them
+in the user's login sessions (bash, zsh, and fish unless
+`programs.fish.useBabelfish` is set), via `aegis.secrets.exportUserEnv`
+(on by default). A variable already set when the session starts, such as
+`PATH`, is never overwritten. A secret added after you log in shows up in your
+next login session.
+
+The Home Manager module puts file secrets where programs look for them:
 
 ```nix
-{ inputs, ... }:
+{ config, inputs, ... }:
 
 {
   imports = [ inputs.aegis.homeManagerModules.default ];
 
   aegis.userSecrets = {
     enable = true;
-    username = "niten";
 
-    sessionVariablesFromSecrets = [
-      "GITHUB_TOKEN"
-      "OPENAI_API_KEY"
-    ];
+    # "<path under $HOME>" = "<secret name>": a symlink to the decrypted file
+    files.".aws/credentials" = "aws-creds";
   };
+
+  # Anywhere else a home.file-style entry goes, `link` is the whole entry
+  xdg.configFile."rclone/rclone.conf" = config.aegis.userSecrets.link "rclone";
+
+  # Options that take a path to read at runtime
+  programs.foo.passwordFile = config.aegis.userSecrets.path "foo-password";
 }
 ```
+
+Links point out of the store, so plaintext never enters `/nix/store`. Until the
+host has decrypted a secret, its link dangles.
 
 ## Modules
 
@@ -107,6 +124,7 @@ Core module. Reads the manifest and generates a decryption unit per secret.
 | `roles` | list of string | from manifest | Roles this host has |
 | `users` | list of string | [] | Users whose secrets to decrypt; must match the user's host list in aegis-secrets |
 | `userGroups` | attrs of string | {} | Group owning a user's secrets, by username (default: their primary group, else `users`) |
+| `exportUserEnv` | bool | true | Export each user's env secrets in their login sessions |
 | `unmanagedUsers` | list of string | [] | Owners that exist outside `users.users` (escape hatch) |
 | `unmanagedGroups` | list of string | [] | Owners that exist outside `users.groups` (escape hatch) |
 | `manageSshd` | bool | true | Make sshd require the units that decrypt its host keys |
@@ -153,7 +171,22 @@ made it a second and divergent source of truth. Migrate to `aegis.secrets`.
 
 ### `aegis.userSecrets` (Home Manager)
 
-Exports decrypted secrets as environment variables.
+Links decrypted file secrets into your home and exports env secrets.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | false | Enable the module |
+| `username` | string | `home.username` | Whose secrets |
+| `secretsBasePath` | string | `/run/aegis/users/<username>` | Where the host decrypts them |
+| `files` | attrs of string | {} | `"<path under $HOME>" = "<file secret>"`, linked into home |
+| `sessionVariablesFromSecrets` | list of string | [] | Env secrets to export at login (not needed where `aegis.secrets.exportUserEnv` is on) |
+| `envVars` | attrs of string | {} | Variable name to a path to read its value from |
+
+Read-only helpers, functions of a secret's name:
+
+- `link "<name>"` — a complete `home.file` / `xdg.configFile` entry linking to the file secret
+- `path "<name>"` — the decrypted file secret's absolute path
+- `envPath "<NAME>"` — the file holding a decrypted env secret's value
 
 ## Systemd Targets
 

@@ -43,6 +43,9 @@
           touch $out
         '';
 
+        # The Home Manager module's links and paths. Evaluation-only.
+        home-secrets = import ./tests/home-secrets.nix { inherit pkgs nixpkgs; };
+
         # NixOS VM tests (only on x86_64-linux for speed)
       } // (if system == "x86_64-linux" then {
         # Basic secret decryption

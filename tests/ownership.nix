@@ -180,7 +180,50 @@ let
     };
   };
 
-  failed = lib.filterAttrs (_: case: !case.ok) cases;
+  # A host secrets directory as 'aegis build user-secrets' leaves it: alice
+  # and bob were built for this host, carol has a directory but no manifest.
+  builtUsersHost = {
+    aegis.secrets.secretsPath = ./fixtures/built-users-host;
+    users.users.alice.isNormalUser = true;
+    users.users.carol.isNormalUser = true;
+  };
+
+  extraCases = {
+    # A user granted the host in aegis-secrets ('*', a role, or by name) needs
+    # nothing in the host's own config: the build output is the list.  bob
+    # was built here but has no account, so there is no one to give them to.
+    users-default-to-built-local-accounts = let
+      users = (evalHost {
+        imports = [ (base { user = "root"; group = "root"; }) builtUsersHost ];
+      }).aegis.secrets.users;
+    in {
+      ok = users == [ "alice" ];
+      why = "aegis.secrets.users must default to built users with an account here (got ${toString users})";
+    };
+
+    users-default-passes-ownership = let
+      msgs = failedMessages {
+        imports = [ (base { user = "root"; group = "root"; }) builtUsersHost ];
+      };
+    in {
+      ok = !(mentions "user \"bob\"" msgs) && !(mentions "user \"alice\"" msgs);
+      why = "the default must never name a user without an account";
+    };
+
+    users-explicit-overrides-default = let
+      users = (evalHost {
+        imports = [ (base { user = "root"; group = "root"; }) builtUsersHost ];
+        aegis.secrets.users = [ "carol" ];
+      }).aegis.secrets.users;
+    in {
+      ok = users == [ "carol" ];
+      why = "an explicit aegis.secrets.users must replace the default";
+    };
+  };
+
+  allCases = cases // extraCases;
+
+  failed = lib.filterAttrs (_: case: !case.ok) allCases;
 
 in if failed != { } then
   throw ''
@@ -190,7 +233,7 @@ in if failed != { } then
 else
   pkgs.runCommand "aegis-ownership-test" { } ''
     echo "ownership validation: ${
-      toString (lib.length (lib.attrNames cases))
+      toString (lib.length (lib.attrNames allCases))
     } cases passed"
     touch $out
   ''

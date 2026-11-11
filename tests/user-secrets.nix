@@ -90,5 +90,8 @@ in pkgs.testers.nixosTest {
 
     # Readable by the user it belongs to, and nobody else.
     machine.succeed(f"su alice -s /bin/sh -c 'cat {base}/env/GITHUB_TOKEN'")
+
+    # Env secrets are in the user's login environment with no per-user config.
+    assert machine.succeed("su -l alice -c 'printf %s \"$GITHUB_TOKEN\"'") == "tok123"
   '';
 }

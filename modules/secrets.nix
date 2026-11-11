@@ -1099,6 +1099,21 @@ in {
       example = { alice = "staff"; };
     };
 
+    exportUserEnv = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Export each of a user's env secrets (/run/aegis/users/<user>/env/<NAME>)
+        as an environment variable in their login sessions, so a secret added
+        with 'aegis-user add-env' needs no per-user configuration.  Runs from
+        the shell environment setup NixOS shares between bash, zsh and fish
+        (environment.extraInit).
+
+        A variable that is already set when the session starts (PATH, HOME,
+        ...) is left alone rather than overwritten by a secret of that name.
+      '';
+    };
+
     unmanagedUsers = mkOption {
       type = types.listOf types.str;
       description = ''
@@ -1302,6 +1317,26 @@ in {
         (entry: "  - ${entry.name} -> ${entry.target}") allEntries
       }
     ''];
+
+    # Each login session picks up the user's env secrets.  Names are
+    # re-checked here because they become shell code via eval/export: a file
+    # dropped into env/ by other means must not be able to inject anything.
+    # Listed with ls rather than a glob, which zsh would turn into an error
+    # for an empty directory.
+    environment.extraInit = mkIf (cfg.exportUserEnv && cfg.users != [ ]) ''
+      __aegis_env="${actualTarget "/run/aegis/users"}/$(id -un 2>/dev/null)/env"
+      if [ -d "$__aegis_env" ] && [ -r "$__aegis_env" ] && [ -x "$__aegis_env" ]; then
+        for __aegis_n in $(command ls -A "$__aegis_env" 2>/dev/null); do
+          case "$__aegis_n" in
+            ""|[!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;;
+          esac
+          [ -f "$__aegis_env/$__aegis_n" ] && [ -r "$__aegis_env/$__aegis_n" ] || continue
+          eval "[ -z \"\''${$__aegis_n+set}\" ]" || continue
+          export "$__aegis_n=$(cat "$__aegis_env/$__aegis_n")"
+        done
+      fi
+      unset __aegis_env __aegis_n
+    '';
 
     systemd.tmpfiles.rules = [
       "d /run/aegis 0755 root root - -"

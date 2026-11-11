@@ -70,25 +70,39 @@ aegis.secrets.secrets.my-api-key = {
 
 ## Home Manager Integration
 
-For user environment variables from secrets:
+A user's secrets are decrypted on each of their hosts to
+`/run/aegis/users/<user>/files/<name>` (from `aegis-user add-file`) and
+`/run/aegis/users/<user>/env/<NAME>` (from `aegis-user add-env`). The Home
+Manager module puts them where programs look for them:
 
 ```nix
-{ inputs, ... }:
+{ config, inputs, ... }:
 
 {
   imports = [ inputs.aegis.homeManagerModules.default ];
 
   aegis.userSecrets = {
     enable = true;
-    username = "niten";
+
+    # "<path under $HOME>" = "<secret name>": a symlink to the decrypted file
+    files.".aws/credentials" = "aws-creds";
 
     sessionVariablesFromSecrets = [
       "GITHUB_TOKEN"
       "OPENAI_API_KEY"
     ];
   };
+
+  # Anywhere else a home.file-style entry goes, `link` is the whole entry
+  xdg.configFile."rclone/rclone.conf" = config.aegis.userSecrets.link "rclone";
+
+  # Options that take a path to read at runtime
+  programs.foo.passwordFile = config.aegis.userSecrets.path "foo-password";
 }
 ```
+
+Links point out of the store, so plaintext never enters `/nix/store`. Until the
+host has decrypted a secret, its link dangles.
 
 ## Modules
 
@@ -153,7 +167,22 @@ made it a second and divergent source of truth. Migrate to `aegis.secrets`.
 
 ### `aegis.userSecrets` (Home Manager)
 
-Exports decrypted secrets as environment variables.
+Links decrypted file secrets into your home and exports env secrets.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | false | Enable the module |
+| `username` | string | `home.username` | Whose secrets |
+| `secretsBasePath` | string | `/run/aegis/users/<username>` | Where the host decrypts them |
+| `files` | attrs of string | {} | `"<path under $HOME>" = "<file secret>"`, linked into home |
+| `sessionVariablesFromSecrets` | list of string | [] | Env secrets to export at login |
+| `envVars` | attrs of string | {} | Variable name to a path to read its value from |
+
+Read-only helpers, functions of a secret's name:
+
+- `link "<name>"` — a complete `home.file` / `xdg.configFile` entry linking to the file secret
+- `path "<name>"` — the decrypted file secret's absolute path
+- `envPath "<NAME>"` — the file holding a decrypted env secret's value
 
 ## Systemd Targets
 

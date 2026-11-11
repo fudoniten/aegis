@@ -178,6 +178,28 @@ let
 
   manifestRoles = manifest.roles or [ ];
 
+  # Users 'aegis build user-secrets' built for this host: one directory each
+  # under users/, holding the manifest the host decrypts.  Who a user reaches
+  # is decided in aegis-secrets (src/users/<user>.toml, where a host list can
+  # be '*' or a role), so reading the result here is what lets a user be
+  # added to many hosts without naming them in each host's config as well.
+  hostUsersPath =
+    if hostSecretsPath == null then null else "${hostSecretsPath}/users";
+  builtUsers = if hostUsersPath != null && builtins.pathExists hostUsersPath then
+    attrNames (filterAttrs (name: type:
+      type == "directory"
+      && builtins.pathExists "${hostUsersPath}/${name}/manifest.age")
+      (builtins.readDir hostUsersPath))
+  else
+    [ ];
+
+  # ...of those, the ones with an account here.  A user can be built for a
+  # host they have no account on -- '*' reaches every host, while accounts
+  # follow the host's own user lists -- and there is nobody to give those
+  # secrets to.  Listing such a user explicitly still fails ownership
+  # validation, as it should: that is a request, not a default.
+  builtLocalUsers = filter (u: elem u declaredUsers) builtUsers;
+
   roleEntries = map (role: {
     name = "role-${role}";
     kind = "plain";
@@ -1051,11 +1073,18 @@ in {
         'aegis build user-secrets').  Each lands in /run/aegis/users/<user>,
         decrypted with the host master key and owned by the user.
 
-        This must match the host list in the user's src/users/<user>.toml:
-        a user listed here whose secrets were not built for this host just
-        gets an empty directory.
+        By default, every user whose secrets were built for this host
+        (a users/<user>/manifest.age exists) and who has an account here
+        (users.users).  So granting a user hosts in aegis-secrets -- by name,
+        '*' or 'role:<role>' -- is all it takes; nothing is listed per host.
+
+        Set it explicitly to restrict or extend that.  A user listed here
+        whose secrets were not built for this host just gets an empty
+        directory, and one without an account fails evaluation.
       '';
-      default = [ ];
+      default = builtLocalUsers;
+      defaultText = literalExpression
+        "users built under users/ in the host secrets directory that are declared in users.users";
       example = [ "alice" ];
     };
 

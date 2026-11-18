@@ -451,6 +451,18 @@ let
 
   dryRunPrefix = if cfg.dryRun then "[AEGIS DRY-RUN] " else "";
 
+  # What each decrypt unit last decrypted, when the ciphertext lives under
+  # runtimePath: one file per entry holding the sha256 of the .age file it
+  # read. Under /run on purpose -- a boot decrypts everything afresh, so an
+  # empty directory after a reboot is exactly right.
+  #
+  # Needed because with runtimePath a unit's script names a path that never
+  # changes, so new ciphertext does not change the unit and
+  # switch-to-configuration has no reason to restart it. See
+  # `staleSecretsActivation` below for what reads it.
+  appliedPath = "/run/aegis-applied";
+  trackApplied = cfg.runtimePath != null;
+
   # Legacy: material written before the tools became binary clean carries a
   # `base64:` sentinel.  Nothing writes it any more, but a keytab encrypted by
   # the old tooling still needs unwrapping, and the module used to ignore the
@@ -498,6 +510,13 @@ let
       # Decrypt to a temporary file and move into place, so a failure leaves
       # the previous secret intact rather than deleting it. A rebuild that
       # cannot decrypt should not take the service down.
+      ${optionalString trackApplied ''
+        # Hashed before decrypting, so a profile switched underneath us
+        # leaves a stamp that is stale (one extra restart) rather than one
+        # that claims ciphertext we never read.
+        SOURCE_SHA=$(${pkgs.coreutils}/bin/sha256sum "${entry.source}" \
+          | ${pkgs.coreutils}/bin/cut -d' ' -f1)
+      ''}
       TMP=$(mktemp "${realTarget}.XXXXXX")
       trap 'rm -f "$TMP"' EXIT
 
@@ -523,6 +542,11 @@ let
 
       ${optionalString cfg.dryRun ''
         echo "${dryRunPrefix}Secret ${entry.name} validated successfully (dry-run mode)"
+      ''}
+
+      ${optionalString trackApplied ''
+        ${pkgs.coreutils}/bin/mkdir -p -m 0700 ${appliedPath}
+        echo "$SOURCE_SHA" > ${appliedPath}/${entry.name}
       ''}
     '';
 
@@ -640,6 +664,49 @@ let
     echo "aegis-verify-profile: ${
       toString (length verifiableEntries)
     } secret(s) verified on ${hostname} ($skipped skipped)."
+  '';
+
+  # -------------------------------------------------------------------------
+  # Restarting units whose ciphertext changed underneath them
+  #
+  # With runtimePath the decrypt scripts name a path that is the same in every
+  # generation, so a re-encrypted or re-signed secret does not change its unit
+  # and switch-to-configuration leaves it alone. The ciphertext profile covers
+  # the case where only ciphertext moved (it restarts every unit itself), but
+  # not the one where the manifest moved too -- a secret added anywhere on the
+  # host -- because then it defers to the system switch, which restarts only
+  # the units whose definitions changed. Every unchanged unit keeps serving
+  # the plaintext it decrypted at boot, indefinitely: a Nebula certificate
+  # re-signed for a new address stayed on the old one until the host rebooted.
+  #
+  # So at activation, which runs after the ciphertext profile is linked and
+  # before any unit is touched, compare what each unit last decrypted against
+  # what is there now and queue the ones that differ for restart. Units with
+  # no stamp are new, or have not run since boot or since this check was
+  # added; the switch starts or restarts those on its own.
+  #
+  # /run/nixos/activation-restart-list is switch-to-configuration's own
+  # channel for this: units named in it are restarted along with the changed
+  # ones. A restart propagates to anything that `Requires=` the unit, which is
+  # how a service consuming the secret (nebula, sshd) picks it up.
+  # -------------------------------------------------------------------------
+  staleSecretsActivation = ''
+    check_applied() {
+      local name="$1" source="$2" stamp="${appliedPath}/$1"
+      [ -r "$stamp" ] || return 0
+      [ -r "$source" ] || return 0
+      local now
+      now=$(${pkgs.coreutils}/bin/sha256sum "$source" | ${pkgs.coreutils}/bin/cut -d' ' -f1)
+      if [ "$(${pkgs.coreutils}/bin/cat "$stamp")" != "$now" ]; then
+        echo "aegis: $name has new ciphertext; restarting aegis-$name.service"
+        ${pkgs.coreutils}/bin/mkdir -p /run/nixos
+        echo "aegis-$name.service" >> /run/nixos/activation-restart-list
+      fi
+    }
+    ${concatMapStringsSep "\n    " (entry:
+      "check_applied ${escapeShellArg entry.name} ${escapeShellArg entry.source}")
+      verifiableEntries}
+    unset -f check_applied
   '';
 
   mkSecretService = entry: {
@@ -1437,6 +1504,10 @@ in {
       in concatMapStrings (unit: "${unit}\n")
       (unitsInPhase 1 ++ unitsInPhase 2);
     };
+
+    system.activationScripts.aegis-stale-secrets =
+      mkIf (cfg.runtimePath != null && verifiableEntries != [ ])
+      (stringAfter [ "specialfs" ] staleSecretsActivation);
 
     # The verifier the activation script runs before touching any unit.
     environment.systemPackages =

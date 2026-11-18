@@ -106,14 +106,28 @@ let
     system.stateVersion = lib.trivial.release;
     networking.hostName = "testhost";
 
+    # Test VMs leave switch-to-configuration out; the stale-ciphertext check
+    # below is an activation-time behaviour and needs it.
+    system.switch.enable = true;
+
     # Stand in for the deploy-rs profile link, and for the master key that
     # profiles/common.nix generates on a real host.
     system.activationScripts.aegis-test-fixture = ''
       mkdir -p /var/lib/aegis
       cp ${keys}/host.key /var/lib/aegis/master-key
       chmod 0400 /var/lib/aegis/master-key
-      ln -sfn ${tree} ${runtimePath}
+      # Only on first activation: a later switch must not undo a rotation.
+      [ -e ${runtimePath} ] || ln -sfn ${tree} ${runtimePath}
     '';
+
+    # Stands in for nebula: a long-running consumer that `Requires=` its
+    # secret's unit, which is how it is meant to pick up a restart of it.
+    systemd.services.consumer = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "aegis-secret-host-thing.service" ];
+      requires = [ "aegis-secret-host-thing.service" ];
+      serviceConfig.ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+    };
 
     aegis.secrets = {
       enable = true;
@@ -163,8 +177,11 @@ in {
       machine.succeed("test $(stat -c %a /run/aegis/secrets/shared) = 400")
 
       # The unit really is reading from outside the store.
+      # (In the script ExecStart names, not the unit file: `systemctl cat`
+      # shows only the script's store path.)
       machine.succeed(
-          "systemctl cat aegis-secret-host-thing.service | grep -q ${runtimePath}"
+          "grep -q ${runtimePath} $(systemctl show -p ExecStart --value"
+          + " aegis-secret-host-thing.service | grep -o 'path=[^ ;]*' | cut -d= -f2)"
       )
 
       # Rotation: repoint the link and restart the unit. No new system
@@ -173,6 +190,36 @@ in {
       machine.succeed("ln -sfn ${rotatedTree} ${runtimePath}")
       machine.succeed("systemctl restart aegis-secret-host-thing.service")
       assert machine.succeed("cat /run/aegis/secrets/host-thing") == "host-secret-rotated"
+
+      # Rotation followed by a switch, with nobody restarting the unit: the
+      # case where the manifest also moved and the ciphertext profile left
+      # restarts to the system switch. The unit's definition is unchanged, so
+      # only the applied-ciphertext check can notice. Rotate back to the
+      # original tree, so this is new ciphertext relative to the stamp.
+      machine.succeed("ln -sfn ${tree} ${runtimePath}")
+      assert machine.succeed("cat /run/aegis/secrets/host-thing") == "host-secret-rotated"
+      machine.wait_for_unit("consumer.service")
+      consumer_before = machine.succeed(
+          "systemctl show -p InvocationID --value consumer.service"
+      )
+      out = machine.succeed(
+          "/run/current-system/bin/switch-to-configuration test 2>&1"
+      )
+      assert "host-thing has new ciphertext" in out, out
+      assert machine.succeed("cat /run/aegis/secrets/host-thing") == "host-secret-value"
+
+      # The consumer was restarted with it, through Requires=.
+      machine.wait_for_unit("consumer.service")
+      consumer_after = machine.succeed(
+          "systemctl show -p InvocationID --value consumer.service"
+      )
+      assert consumer_before != consumer_after, "consumer was not restarted"
+
+      # ...and a switch with nothing changed restarts nothing.
+      out = machine.succeed(
+          "/run/current-system/bin/switch-to-configuration test 2>&1"
+      )
+      assert "new ciphertext" not in out, out
 
       print("runtime-path test passed!")
     '';
